@@ -1,0 +1,18 @@
+{
+  "name": "deux-toits",
+  "version": "0.1.0",
+  "description": "MVP Deux Toits : prévenir l'autre parent d'un changement par SMS, sans compte, et rappeler les affaires la veille.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "SMS_PROVIDER=console node --watch src/server.js",
+    "test": "node --no-warnings --test test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
