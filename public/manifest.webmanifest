@@ -1,0 +1,11 @@
+{
+  "name": "Deux Toits",
+  "short_name": "Deux Toits",
+  "lang": "fr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#F3F5F7",
+  "theme_color": "#0E6B6B",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

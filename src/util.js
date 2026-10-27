@@ -2,17 +2,6 @@ import crypto from 'node:crypto';
 
 export const TZ = process.env.TZ_FAMILLE || 'Europe/Paris';
 
-// --- Téléphones ---------------------------------------------------------
-// Accepte « 06 12 34 56 78 », « 0612345678 », « +33 6 12 34 56 78 », « 0033… ».
-export function normalizePhone(raw) {
-  if (!raw) return null;
-  let p = String(raw).replace(/[\s.\-()]/g, '');
-  if (p.startsWith('00')) p = '+' + p.slice(2);
-  if (/^0[1-9]\d{8}$/.test(p)) p = '+33' + p.slice(1);
-  if (!/^\+\d{8,15}$/.test(p)) return null;
-  return p;
-}
-
 // --- Rôles et codes -----------------------------------------------------
 // Liste fermée : impossible d'enregistrer un prénom à la place d'un rôle.
 export const ROLES = ['Papa', 'Maman', 'Parent', 'Beau-père', 'Belle-mère', 'Papi', 'Mamie', 'Nounou', 'Autre proche'];
@@ -25,7 +14,7 @@ export function uniqueRole(role, taken) {
   return `${role} ${n}`;
 }
 
-// Alphabet sans 0/O/1/I/L : lisible à voix haute et sur un SMS.
+// Alphabet sans 0/O/1/I/L : lisible à voix haute.
 const CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
 export function newCode(length) {
   let out = '';
@@ -35,15 +24,14 @@ export function newCode(length) {
 export const CLAIM_LENGTH = 8;   // invitation d'un proche : ABCD-EFGH
 export const ACCESS_LENGTH = 12; // accès de l'organisateur : ABCD-EFGH-JKMN
 export const groupCode = (code) => String(code).match(/.{1,4}/g).join('-');
-// Accepte « abcd efgh », « ABCD-EFGH », « code ABCD-EFGH » ; renvoie null si le format est impossible.
+// Accepte « abcd efgh », « ABCD-EFGH » ; renvoie null si le format est impossible.
 export function parseCode(raw, length) {
-  const c = String(raw || '').toUpperCase().replace(/^CODE\b/, '').replace(/[\s\-_.]/g, '');
+  const c = String(raw || '').toUpperCase().replace(/[\s\-_.]/g, '');
   return c.length === length && [...c].every((ch) => CODE_ALPHABET.includes(ch)) ? c : null;
 }
 export const hashCode = (code) => crypto.createHash('sha256').update(code).digest('hex');
-export const maskPhone = (p) => (p ? `•• •• •• ${String(p).slice(-2)}` : '');
 
-// --- Santé : jamais dans un SMS ---------------------------------------
+// --- Santé : jamais dans une notification ---------------------------------------
 // Comparaison sans accents (les claviers iOS envoient parfois des accents décomposés).
 const fold = (s) => String(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 const HEALTH_WORDS = [

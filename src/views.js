@@ -1,5 +1,5 @@
 // Gabarits HTML (sans moteur de template). Toute donnée affichée passe par esc().
-import { ROLES, esc, frDate, frDayName, frTime, maskPhone } from './util.js';
+import { ROLES, esc, frDate, frDayName, frTime } from './util.js';
 
 const ICON = {
   back: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>',
@@ -21,16 +21,21 @@ const STATUS = {
   cancelled: ['Annulé', 'badge-muted']
 };
 
-export function layout(title, body, { nav = null, wide = false } = {}) {
+export function layout(title, body, { nav = null, wide = false, manifest = null } = {}) {
+  const manifestUrl = manifest ?? (nav ? '/manifest.webmanifest' : null);
   return `<!doctype html>
 <html lang="fr">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)} — Deux Toits</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700&family=Figtree:wght@400;500;600;700&display=swap" rel="stylesheet">
+<meta name="theme-color" content="#0E6B6B">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+${manifestUrl ? `<link rel="manifest" href="${esc(manifestUrl)}">` : ''}
 <link rel="stylesheet" href="/style.css">
+<script src="/push.js" defer></script>
 </head>
 <body>
 <div class="app${wide ? ' app-wide' : ''}">
@@ -74,8 +79,7 @@ export function authPage({ mode, error, values = {} }) {
   <form method="post" action="${signup ? '/signup' : '/login'}" class="stack">
     ${signup ? `<label class="field">Vous êtes
       <select name="role" required>${ROLES.map((r) => `<option value="${esc(r)}" ${values.role === r ? 'selected' : ''}>${esc(r)}</option>`).join('')}</select>
-      <span class="hint">Un rôle, pas un nom : Deux Toits ne garde ni prénom, ni nom, ni e-mail pour les adultes.</span></label>
-    <label class="field">Votre téléphone<input name="phone" required inputmode="tel" value="${esc(values.phone)}" autocomplete="tel" placeholder="06 12 34 56 78"><span class="hint">Pour recevoir les réponses de l'autre parent.</span></label>
+      <span class="hint">Un rôle, pas un nom : Deux Toits ne garde ni nom, ni e-mail, ni numéro de téléphone.</span></label>
     <button class="btn btn-primary">Créer mon espace</button>` : `<label class="field">Votre code d'accès<input name="code" required autocomplete="off" autocapitalize="characters" spellcheck="false" class="code-input" placeholder="XXXX-XXXX-XXXX"></label>
     <button class="btn btn-primary">Me connecter</button>`}
   </form>
@@ -100,34 +104,23 @@ export function accessCodePage({ code, first }) {
 }
 
 // --- Invitation d'un proche ------------------------------------------------------
-export function joinPage({ code, invitation, error, phone }) {
-  return layout('Enregistrer mon numéro', `
+export function joinPage({ code, invitation, error }) {
+  return layout('Rejoindre', `
 <main class="main narrow">
   <p class="eyebrow">Deux Toits</p>
-  <h1 class="h-hero">${invitation ? `Vous êtes « ${esc(invitation.role)} »` : 'Enregistrer mon numéro'}</h1>
-  <p>${invitation ? `${esc(invitation.organizer_role)} vous invite à recevoir les changements de planning par SMS.` : 'Entrez le code reçu en main propre ou par message.'} Pas de compte, pas de nom : seulement ce numéro, lié à ce rôle.</p>
+  <h1 class="h-hero">${invitation ? (invitation.kind === 'child' ? `Le calendrier de ${esc(invitation.label)}` : `Vous êtes « ${esc(invitation.label)} »`) : 'Rejoindre'}</h1>
+  <p>${invitation ? (invitation.kind === 'child' ? `${esc(invitation.organizer_role)} vous donne accès à votre calendrier : chez qui vous dormez, et ce qu'il faut prendre.` : `${esc(invitation.organizer_role)} vous invite à être prévenu des changements de planning.`) : 'Entrez le code reçu en main propre ou par message.'} Pas de compte, pas de nom, pas de numéro : cet appareil reçoit une page personnelle et, si vous le voulez, des notifications.</p>
   ${error ? `<p class="flash flash-error" role="alert">${esc(error)}</p>` : ''}
   <form method="post" action="/j" class="stack">
     <label class="field">Code d'invitation<input name="code" required autocomplete="off" autocapitalize="characters" spellcheck="false" class="code-input" value="${esc(code)}" placeholder="XXXX-XXXX"></label>
-    <label class="field">Votre téléphone<input name="phone" required inputmode="tel" autocomplete="tel" value="${esc(phone)}" placeholder="06 12 34 56 78"></label>
-    <button class="btn btn-primary btn-big">Enregistrer mon numéro</button>
+    <button class="btn btn-primary btn-big">Rejoindre</button>
   </form>
-  <p class="fine">Vous pouvez aussi envoyer ce code par SMS au numéro de Deux Toits quand il vous est communiqué. Un message de confirmation vous est envoyé.</p>
-</main>`);
-}
-
-export function joinedPage({ role, organizerRole, canReceive }) {
-  return layout('C\'est enregistré', `
-<main class="main narrow">
-  <h1 class="h-hero">C'est enregistré.</h1>
-  <section class="status-card status-ok" role="status"><p class="status-title">Ce numéro est « ${esc(role)} »</p>
-    <p>Vous recevrez par SMS les changements de planning de ${esc(organizerRole)}${canReceive ? ' et répondrez OUI ou NON' : ' et répondrez depuis le lien reçu'}. Rien d'autre.</p></section>
-  <p class="fine">Le code est maintenant inutilisable. ${canReceive ? 'Répondez STOP à un SMS pour ne plus rien recevoir.' : 'Chaque SMS contient un lien pour ne plus rien recevoir.'}</p>
+  <p class="fine">Le code ne sert qu'une fois.</p>
 </main>`);
 }
 
 // --- Accueil ---------------------------------------------------------------
-export function homePage({ org, week, recent, setupNeeded, flash }) {
+export function homePage({ org, week, recent, setupNeeded, flash, noDevice }) {
   const next = week.days.find((d) => d.isHandover);
   return layout('Cette semaine', `
 <header class="topbar topbar-home">
@@ -136,6 +129,7 @@ export function homePage({ org, week, recent, setupNeeded, flash }) {
 <main class="main">
   ${flashBox(flash)}
   ${setupNeeded ? `<section class="card card-accent"><p class="strong">Pour commencer</p><p>Ajoutez vos enfants et l'autre parent.</p><a class="btn btn-primary" href="/famille">Compléter ma famille</a></section>` : ''}
+  ${noDevice && !setupNeeded ? `<section class="card"><p class="strong">Soyez prévenu des réponses</p><p class="fine">Activez les notifications sur cet appareil pour savoir quand l'autre parent répond.</p><a class="btn btn-secondary" href="/famille">Activer</a></section>` : ''}
   ${next ? `<section class="hero-card" aria-label="Prochain passage">
     <p class="hero-eyebrow">Prochain passage</p>
     <p class="hero-title">${esc(frDate(next.date))}</p>
@@ -185,36 +179,53 @@ function changeCard(c) {
 }
 
 // --- Famille ----------------------------------------------------------------
-function memberCard(p) {
-  if (p.phone) {
-    return `<div class="member"><div class="row-between"><span><span class="strong">${esc(p.role)}</span> <span class="muted">${esc(maskPhone(p.phone))} · numéro enregistré${p.opted_out ? ' · a demandé STOP' : ''}</span></span></div>
-    <div class="row-between"><form method="post" action="/famille/parents/${p.id}/code"><button class="btn-text">Changer de numéro</button></form>
-    <form method="post" action="/famille/parents/${p.id}/supprimer"><button class="btn-text">Retirer</button></form></div></div>`;
+function pushBox({ publicKey, base, scope, sw }) {
+  return `<div class="pushbox" data-push data-key="${esc(publicKey)}" data-base="${esc(base)}" data-scope="${esc(scope)}" data-sw="${esc(sw)}">
+  <p class="fine" data-push-status>Vérification…</p>
+  <button type="button" class="btn btn-secondary" data-push-on hidden>Activer les notifications</button>
+  <button type="button" class="btn-text" data-push-off hidden>Désactiver sur cet appareil</button>
+</div>`;
+}
+
+// Carte d'invitation d'un proche (path « parents ») ou d'un enfant (path « enfants ») : QR + code tant qu'il n'a pas rejoint.
+function inviteCard(p, { label, path, who, joinedText }) {
+  const actions = (renew) => `<div class="row-between"><form method="post" action="/famille/${path}/${p.id}/code"><button class="btn-text">${renew}</button></form>
+    <form method="post" action="/famille/${path}/${p.id}/supprimer"><button class="btn-text">Retirer</button></form></div>`;
+  if (p.joined) {
+    return `<div class="member"><div class="row-between"><span><span class="strong">${esc(label)}</span> <span class="muted">${esc(joinedText)}</span></span></div>${actions('Nouveau code (changement d\'appareil)')}</div>`;
   }
-  return `<div class="member member-pending"><div class="row-between"><span><span class="strong">${esc(p.role)}</span> <span class="muted">en attente de son numéro</span></span></div>
+  if (!p.claim_code) {
+    return `<div class="member"><div class="row-between"><span><span class="strong">${esc(label)}</span> <span class="muted">a quitté</span></span></div>${actions('Nouveau code')}</div>`;
+  }
+  return `<div class="member member-pending"><div class="row-between"><span><span class="strong">${esc(label)}</span> <span class="muted">n'a pas encore rejoint</span></span></div>
     <div class="invite">
-      <div class="qr" role="img" aria-label="QR code d'invitation pour ${esc(p.role)}">${p.qr}</div>
-      <div class="stack-s"><p class="fine">En présentiel : ${esc(p.role)} scanne ce QR code. À distance : il tape ce code.</p>
+      <div class="qr" role="img" aria-label="QR code d'invitation pour ${esc(label)}">${p.qr}</div>
+      <div class="stack-s"><p class="fine">En présentiel : ${esc(who)} scanne ce QR code. À distance : ${esc(who)} tape ce code.</p>
       <p class="code-big code-sm" translate="no">${esc(p.codeLabel)}</p>
       <p class="fine">Valable 14 jours, une seule fois.</p></div>
-    </div>
-    <div class="row-between"><form method="post" action="/famille/parents/${p.id}/code"><button class="btn-text">Nouveau code</button></form>
-    <form method="post" action="/famille/parents/${p.id}/supprimer"><button class="btn-text">Retirer</button></form></div></div>`;
+    </div>${actions('Nouveau code')}</div>`;
 }
-export function familyPage({ org, kids, coparents, roles, joinUrl, flash }) {
+const parentCard = (p) => inviteCard(p, {
+  label: p.role, path: 'parents', who: 'il',
+  joinedText: `a rejoint · ${p.devices ? `${p.devices} appareil${p.devices > 1 ? 's' : ''} notifié${p.devices > 1 ? 's' : ''}` : 'pas de notification (verra sa page)'}`
+});
+const childCard = (k) => inviteCard(k, { label: k.name, path: 'enfants', who: 'l\'enfant', joinedText: 'a son calendrier sur son appareil' });
+
+export function familyPage({ org, kids, coparents, roles, joinUrl, flash, devices, publicKey }) {
   return layout('Famille', `
 ${header('Famille')}
 <main class="main">
   ${flashBox(flash)}
   <section class="card stack-s" aria-label="Enfants">
     <h2 class="h-section">Enfants</h2>
-    ${kids.map((k) => `<form method="post" action="/famille/enfants/${k.id}/supprimer" class="row-between"><span class="strong">${esc(k.name)}</span><button class="btn-text">Retirer</button></form>`).join('')}
+    <p class="fine">Chaque enfant peut avoir son calendrier sur son propre appareil : il scanne son QR code ou tape son code sur <span translate="no">${esc(joinUrl)}</span>. Il y voit chez qui il dort et ce qu'il doit prendre, rien d'autre.</p>
+    ${kids.map(childCard).join('')}
     <form method="post" action="/famille/enfants" class="row-form"><label class="sr-only" for="kid">Prénom de l'enfant</label><input id="kid" name="name" required maxlength="30" placeholder="Prénom"><button class="btn btn-secondary">Ajouter</button></form>
   </section>
   <section class="card stack-s" aria-label="Parents et proches à prévenir">
     <h2 class="h-section">Parent(s) à prévenir</h2>
-    <p class="fine">Pas de nom : un rôle et un code. Chacun enregistre lui-même son numéro, en scannant son QR code ou en tapant son code sur <span translate="no">${esc(joinUrl)}</span>. Aucun compte à créer.</p>
-    ${coparents.map(memberCard).join('')}
+    <p class="fine">Pas de nom : un rôle et un code. Chacun rejoint depuis son appareil, en scannant son QR code ou en tapant son code sur <span translate="no">${esc(joinUrl)}</span>. Aucun compte à créer.</p>
+    ${coparents.map(parentCard).join('')}
     <form method="post" action="/famille/parents" class="row-form">
       <label class="sr-only" for="role">Rôle</label>
       <select id="role" name="role" required>${roles.map((r) => `<option>${esc(r)}</option>`).join('')}</select>
@@ -223,7 +234,9 @@ ${header('Famille')}
   </section>
   <section class="card stack-s" aria-label="Mon accès">
     <h2 class="h-section">Mon accès</h2>
-    <p class="fine">Vous êtes ${esc(org.role)}. Votre code d'accès n'est pas conservé : en cas de perte, créez-en un nouveau (l'ancien cessera de fonctionner).</p>
+    <p class="fine">Vous êtes ${esc(org.role)}. ${devices ? `${devices} appareil${devices > 1 ? 's' : ''} notifié${devices > 1 ? 's' : ''} des réponses.` : 'Aucun appareil notifié des réponses.'}</p>
+    ${pushBox({ publicKey, base: '', scope: '/', sw: '/sw.js' })}
+    <p class="fine">Votre code d'accès n'est pas conservé : en cas de perte, créez-en un nouveau (l'ancien cessera de fonctionner).</p>
     <form method="post" action="/compte/code"><button class="btn btn-secondary">Créer un nouveau code d'accès</button></form>
   </section>
   <section class="card stack-s" aria-label="Rythme">
@@ -267,12 +280,12 @@ ${header('Signaler un changement', '/')}
     </div>
     <label class="field">Où<input name="place" maxlength="60" value="${esc(v.place || '')}" placeholder="École, dojo, arrêt du car…"></label>
     <label class="field">Qui prévenir
-      <select name="coparentId">${coparents.map((p) => `<option value="${p.id}" ${p.phone ? '' : 'disabled'} ${String(v.coparentId) === String(p.id) ? 'selected' : ''}>${esc(p.role)} · ${p.phone ? 'par SMS' : 'numéro non enregistré'}</option>`).join('')}</select>
+      <select name="coparentId">${coparents.map((p) => `<option value="${p.id}" ${p.joined ? '' : 'disabled'} ${String(v.coparentId) === String(p.id) ? 'selected' : ''}>${esc(p.role)} · ${p.joined ? 'notifié' : 'n\'a pas rejoint'}</option>`).join('')}</select>
     </label>
     <fieldset class="fs"><legend>À prévoir</legend>
       <div class="chips">${SUGGESTED_ITEMS.map((i) => `<label class="chip"><input type="checkbox" name="items" value="${esc(i)}" ${selectedItems.includes(i) ? 'checked' : ''}><span>${esc(i)}</span></label>`).join('')}</div>
       <label class="field">Autre chose<input name="items" maxlength="80" value="${esc(extra)}" placeholder="Séparez par des virgules"></label>
-      <p class="fine">Les informations de santé (médicaments, traitement…) ne sont jamais envoyées par SMS.</p>
+      <p class="fine">Les informations de santé (médicaments, traitement…) ne sont jamais envoyées.</p>
     </fieldset>
     <button class="btn btn-primary btn-big">Voir le message</button>
   </form>
@@ -284,16 +297,16 @@ export function previewPage({ text, values, coparentName, privateItems = [] }) {
   return layout('Aperçu', `
 ${header(`Ce que ${coparentName} va recevoir`, '/')}
 <main class="main">
-  <p class="muted">Un SMS court, signé de votre prénom. ${esc(coparentName)} répond OUI ou NON, sans compte ni appli.</p>
-  <section class="sms-box" aria-label="Aperçu du SMS"><p class="sms-bubble">${esc(text).replace(/\n/g, '<br>')}</p></section>
-  ${privateItems.length ? `<p class="fine">Note privée, non envoyée : ${esc(privateItems.join(', '))}. Les informations de santé ne partent jamais par SMS.</p>` : ''}
+  <p class="muted">Une notification courte, signée de votre rôle. ${esc(coparentName)} répond d'un geste, sans compte.</p>
+  <section class="sms-box" aria-label="Aperçu de la notification"><p class="sms-bubble">${esc(text).replace(/\n/g, '<br>')}</p></section>
+  ${privateItems.length ? `<p class="fine">Note privée, non envoyée : ${esc(privateItems.join(', '))}. Les informations de santé ne partent jamais.</p>` : ''}
   <p class="fine">Pas d'accusé de lecture : vous saurez seulement si ${esc(coparentName)} a répondu.</p>
   <form method="post" action="/changes" class="stack-s">${hidden}<button class="btn btn-primary btn-big">Envoyer</button></form>
   <form method="post" action="/changes/new" class="stack-s">${hidden}<button class="btn btn-secondary">Modifier</button></form>
 </main>`);
 }
 
-export function changePage({ change, smsLog, flash }) {
+export function changePage({ change, notifs, flash }) {
   const c = change;
   const [label, cls] = STATUS[c.status];
   return layout(frDate(c.date), `
@@ -308,48 +321,82 @@ ${header(frDate(c.date), '/')}
           : `En attente de la réponse de ${esc(c.coparent.role)}`}</p>
     <p>${c.kind === 'pickup' ? 'Récupération' : 'Garde'} de ${esc(c.kidNames)}${c.time ? ` · ${esc(frTime(c.time))}` : ''}${c.place ? ` · ${esc(c.place)}` : ''}</p>
     ${c.items.length ? `<p>À prévoir : ${esc(c.items.join(', '))}</p>` : ''}
-    ${c.privateItems.length ? `<p class="fine">Note privée (non envoyée par SMS) : ${esc(c.privateItems.join(', '))}</p>` : ''}
+    ${c.privateItems.length ? `<p class="fine">Note privée (non envoyée) : ${esc(c.privateItems.join(', '))}</p>` : ''}
   </section>
   <section class="card stack-s" aria-label="Messages">
-    <h2 class="h-section">Messages</h2>
-    ${smsLog.map((m) => `<div class="log"><p class="fine">${m.direction === 'out' ? 'Envoyé' : 'Reçu'} · ${esc(m.created_at)} UTC${m.error ? ` · échec : ${esc(m.error)}` : ''}</p><p>${esc(m.body).replace(/\n/g, '<br>')}</p></div>`).join('')}
+    <h2 class="h-section">Notifications</h2>
+    ${notifs.map((m) => `<div class="log"><p class="fine">${m.audience === 'coparent' ? `Envoyé à ${esc(c.coparent.role)}` : 'Reçu par vous'} · ${esc(m.created_at)} UTC${m.delivered ? '' : ` · non distribué (${esc(m.error || 'inconnu')})`}</p><p>${esc(m.title)}${m.body ? `<br>${esc(m.body)}` : ''}</p></div>`).join('')}
   </section>
   ${c.status === 'counter' && !c.isPast ? `<form method="post" action="/changes/${c.id}/accepter-proposition"><button class="btn btn-primary btn-big">Accepter : ${esc(c.counter_label)}</button></form>` : ''}
-  ${c.coparent.opted_out ? `<p class="fine">${esc(c.coparent.role)} a demandé à ne plus recevoir de SMS : prévenez-le autrement.</p>` : ''}
   ${c.status !== 'cancelled' && !c.isPast ? `<form method="post" action="/changes/${c.id}/annuler"><button class="btn btn-secondary">Annuler ce changement</button></form>` : ''}
 </main>`, { nav: 'home' });
 }
 
-// --- Page de réponse sans compte -------------------------------------------------
-export function replyPage({ change, options, done, flash, optedOut = false }) {
-  const c = change;
-  const q = c.kind === 'pickup'
-    ? `Pouvez-vous récupérer ${c.kidNames} ${frDate(c.date)} ?`
-    : `Pouvez-vous garder ${c.kidNames} ${frDate(c.date)} ?`;
-  return layout(q, `
-<div class="urlbar">Aucun compte nécessaire</div>
-<main class="main">
-  <p class="muted">${esc(c.organizer.role)} vous demande</p>
-  <h1 class="h-page h-xl">${esc(q)}</h1>
-  <dl class="facts">
-    ${c.time ? `<div><dt>Heure</dt><dd>${esc(frTime(c.time))}</dd></div>` : ''}
-    ${c.place ? `<div><dt>Où</dt><dd>${esc(c.place)}</dd></div>` : ''}
-    ${c.items.length ? `<div class="span-2"><dt>À prévoir</dt><dd>${esc(c.items.join(', '))}</dd></div>` : ''}
-  </dl>
-  ${flashBox(flash)}
-  ${done || c.status !== 'pending'
-    ? `<section class="status-card status-ok" role="status"><p class="status-title">${c.status === 'accepted' ? `Merci, c'est transmis à ${esc(c.organizer.role)}.` : 'Réponse envoyée.'}</p>
-       <p>${c.status === 'accepted' && c.items.length ? 'Un rappel arrivera la veille au soir. Répondez STOP au SMS pour ne plus en recevoir.' : `${esc(c.organizer.role)} reçoit votre réponse par SMS.`}</p></section>`
-    : `<form method="post" action="/r/${esc(c.token)}" class="stack-s">
+// --- Page personnelle d'un proche (lien secret, sans compte) --------------------------
+function requestCard(c, base, focus) {
+  const question = c.kind === 'pickup'
+    ? `Peux-tu récupérer ${c.kidNames} ${frDate(c.date)} ?`
+    : `Peux-tu garder ${c.kidNames} ${frDate(c.date)} ?`;
+  const facts = [c.time ? `Heure : ${frTime(c.time)}` : '', c.place ? `Où : ${c.place}` : '', c.items.length ? `À prévoir : ${c.items.join(', ')}` : '']
+    .filter(Boolean).map((f) => `<li>${esc(f)}</li>`).join('');
+  const state = c.status === 'accepted' ? '<p class="status-title">Confirmé, merci.</p>'
+    : c.status === 'declined' ? '<p class="status-title">Vous avez répondu que ce n\'est pas possible.</p>'
+      : c.status === 'counter' ? `<p class="status-title">Votre proposition : ${esc(c.counter_label)}</p><p class="fine">${esc(c.organizer.role)} doit encore l'accepter.</p>`
+        : '';
+  const buttons = c.status === 'pending'
+    ? `<form method="post" action="${esc(base)}/changes/${c.id}/answer" class="stack-s">
         <button name="answer" value="yes" class="btn btn-primary btn-big">Oui, c'est noté</button>
         <fieldset class="fs"><legend>Ou proposer autre chose</legend>
-          ${options.map((o) => `<button name="answer" value="${o.id}" class="btn btn-option">${esc(o.label.charAt(0).toUpperCase() + o.label.slice(1))}</button>`).join('')}
+          ${c.options.map((o) => `<button name="answer" value="${o.id}" class="btn btn-option">${esc(o.label.charAt(0).toUpperCase() + o.label.slice(1))}</button>`).join('')}
           <button name="answer" value="no" class="btn btn-option">Non, je ne peux pas</button>
         </fieldset>
-      </form>`}
-  <p class="fine">Deux Toits n'affiche que des informations pratiques. Pas de messagerie, pas de compte, pas de géolocalisation.</p>
-  ${optedOut ? '' : `<form method="post" action="/r/${esc(c.token)}/stop"><button class="btn-text">Ne plus recevoir de SMS de Deux Toits</button></form>`}
-</main>`);
+      </form>` : '';
+  return `<section class="card stack-s${focus === c.id ? ' card-accent' : ''}" id="c${c.id}" aria-label="${esc(question)}">
+    <p class="muted">${esc(c.organizer.role)} vous demande</p>
+    <h2 class="h-section">${esc(question)}</h2>
+    ${facts ? `<ul class="facts-list">${facts}</ul>` : ''}
+    ${state}${buttons}
+  </section>`;
+}
+
+export function memberPage({ member, base, changes, flash, devices, publicKey, focus, welcome }) {
+  return layout('Ma page', `
+<header class="topbar topbar-home"><div><p class="muted">Vous êtes ${esc(member.role)}</p><h1 class="h-page h-xl">Mes demandes</h1></div></header>
+<main class="main">
+  ${flashBox(flash)}
+  ${welcome ? `<section class="card card-accent stack-s"><p class="strong">Bienvenue. Gardez cette page.</p>
+    <p>Cette adresse est votre accès : mettez-la en favori, ou ajoutez-la à l'écran d'accueil. Ne la partagez pas. ${esc(member.organizer_role)} ne connaît ni votre nom ni votre numéro, seulement votre rôle.</p></section>` : ''}
+  <section class="card stack-s" aria-label="Notifications">
+    <h2 class="h-section">Notifications</h2>
+    <p class="fine">${devices ? 'Cet appareil ou un autre est déjà prévenu.' : 'Sans notification, les demandes apparaissent ici quand vous ouvrez la page.'} Sur iPhone, ajoutez d'abord la page à l'écran d'accueil.</p>
+    ${pushBox({ publicKey, base, scope: `${base}/`, sw: `${base}/sw.js` })}
+  </section>
+  ${changes.length ? changes.map((c) => requestCard(c, base, focus)).join('') : '<p class="muted">Aucune demande à venir.</p>'}
+  <p class="fine">Deux Toits n'affiche que des informations pratiques. Pas de messagerie, pas de compte, pas de nom, pas de numéro.</p>
+  <form method="post" action="${esc(base)}/leave"><button class="btn-text">Quitter Deux Toits (oublier cette page et mes appareils)</button></form>
+</main>`, { manifest: `${base}/manifest.webmanifest` });
+}
+
+// --- Page d'un enfant : calendrier en lecture seule (lien secret, sans compte) ------------------
+export function childPage({ child, week, base, welcome }) {
+  const org = week.org.role;
+  const day = (d) => `<li class="day">
+  ${swatch(d.home)}
+  <div class="day-main"><p class="day-name">${esc(frDayName(d.date))} <span class="muted">${esc(frDate(d.date).split(' ').slice(1).join(' '))}</span></p>
+  <p class="day-note">${d.home === 'organizer' ? `Chez ${esc(org)}` : d.home === 'coparent' ? 'Chez l\'autre parent' : ''}${d.isHandover ? ' · jour du changement de maison' : ''}</p>
+  ${d.notes.length ? `<p class="day-note">${esc(d.notes.join(' · '))}</p>` : ''}</div>
+  ${d.items.length ? `<span class="chip-bag">${ICON.bag}${esc(d.items.join(', '))}</span>` : ''}
+</li>`;
+  return layout('Mon calendrier', `
+<header class="topbar topbar-home"><div><p class="muted">Bonjour ${esc(child.name)}</p><h1 class="h-page h-xl">Mon calendrier</h1></div></header>
+<main class="main">
+  ${welcome ? `<section class="card card-accent stack-s"><p class="strong">C'est ton calendrier.</p>
+    <p>Ajoute cette page à l'écran d'accueil pour la retrouver. Elle change toute seule quand les parents modifient le planning. Ne la partage pas.</p></section>` : ''}
+  <p class="legend"><span class="sw sw-a">${ICON.houseRound}</span>Chez ${esc(org)} (le rond) <span class="sw sw-b">${ICON.houseSquare}</span>Chez l'autre parent (le carré)</p>
+  <ol class="days">${week.days.map(day).join('')}</ol>
+  <p class="fine">Les 14 prochains jours. Cette page ne montre que ce qui est confirmé.</p>
+  <form method="post" action="${esc(base)}/leave"><button class="btn-text">Supprimer cette page de mon appareil</button></form>
+</main>`, { manifest: `${base}/manifest.webmanifest` });
 }
 
 export function notFoundPage(text = 'Cette page n\'existe pas ou n\'est plus active.') {
@@ -382,21 +429,4 @@ export function printPage({ week, kids, start, bw }) {
   </ol>
   <p class="fine">Valable au ${esc(frDate(start))}. Un changement ? Réimprimez la feuille.</p>
 </main>`, { wide: true });
-}
-
-// --- Outil de test (mode console uniquement) --------------------------------------------
-export function devSmsPage({ log, coparents }) {
-  return layout('SMS simulés', `
-${header('SMS simulés', '/')}
-<main class="main">
-  <p class="muted">Mode test : aucun SMS réel n'est envoyé. Simulez ici la réponse de l'autre parent.</p>
-  <form method="post" action="/dev/sms" class="card stack-s">
-    <label class="field">Depuis le numéro de
-      <select name="from">${coparents.filter((p) => p.phone).map((p) => `<option value="${esc(p.phone)}">${esc(p.role)} (${esc(p.phone)})</option>`).join('')}</select>
-    </label>
-    <label class="field">Message<input name="body" required placeholder="OUI, NON, STOP…"></label>
-    <button class="btn btn-primary">Simuler la réponse SMS</button>
-  </form>
-  ${log.map((m) => `<div class="card log"><p class="fine">${m.direction === 'out' ? '→' : '←'} ${esc(m.phone)} · ${esc(m.created_at)} UTC</p><p>${esc(m.body).replace(/\n/g, '<br>')}</p></div>`).join('')}
-</main>`);
 }

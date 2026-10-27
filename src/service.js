@@ -1,45 +1,63 @@
-// Logique métier : changements, réponses, SMS entrants, rappels, semaine.
+// Logique métier : changements, réponses, notifications, rappels, semaine.
 import {
-  CLAIM_LENGTH, addDays, frDate, frTime, isHealthItem, isValidDate, joinFr, localParts, newCode, newToken,
-  normalizePhone, parseCode, shiftTime, splitItems, toMinutes, uniqueRole
+  CLAIM_LENGTH, addDays, frDate, frTime, hashCode, isHealthItem, isValidDate, joinFr, localParts, newCode, newToken,
+  parseCode, shiftTime, splitItems, toMinutes, uniqueRole
 } from './util.js';
 
-export function createService({ db, sms, baseUrl, reminderHour = process.env.REMINDER_HOUR || '19:00' }) {
+export function createService({ db, push, reminderHour = process.env.REMINDER_HOUR || '19:00' }) {
   const q = (sql) => db.prepare(sql);
   const reminderMinutes = toMinutes(reminderHour);
   if (reminderMinutes === null) throw new Error(`REMINDER_HOUR invalide : « ${reminderHour} » (format attendu HH:MM).`);
   const today = () => localParts().date;
 
-  // --- Désinscriptions (STOP) ------------------------------------------------------
-  const isOptedOut = (phone) => !!phone && !!q('SELECT 1 FROM opt_outs WHERE phone = ?').get(phone);
-  const optOut = (phone) => q('INSERT OR IGNORE INTO opt_outs (phone) VALUES (?)').run(phone);
-  const optIn = (phone) => q('DELETE FROM opt_outs WHERE phone = ?').run(phone);
-
-  // Tout SMS sortant passe par ici ; un numéro désinscrit ne reçoit plus rien.
-  async function sendSms(phone, body, { changeId = null, kind = 'system' } = {}) {
-    if (!phone) return { ok: false, error: 'numéro non enregistré' };
-    if (isOptedOut(phone)) return { ok: false, error: 'numéro désinscrit (STOP)' };
-    let providerId = null;
-    let error = null;
-    try {
-      ({ id: providerId } = await sms.send(phone, body));
-    } catch (e) {
-      error = e.message;
-      console.error('Échec d\'envoi SMS :', e.message);
+  // --- Notifications (Web Push) ------------------------------------------------------
+  // Toute notification passe par ici. Un appareil disparu (404/410) est oublié automatiquement.
+  async function notify(audience, ownerId, payload, { changeId = null, kind = 'system' } = {}) {
+    const col = audience === 'organizer' ? 'organizer_id' : 'coparent_id';
+    const subs = q(`SELECT * FROM push_subscriptions WHERE ${col} = ?`).all(ownerId);
+    let delivered = 0;
+    let error = subs.length ? null : 'aucun appareil abonné aux notifications';
+    for (const s of subs) {
+      try {
+        await push.send({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, { ...payload, changeId });
+        delivered++;
+      } catch (e) {
+        if (e.statusCode === 404 || e.statusCode === 410) q('DELETE FROM push_subscriptions WHERE id = ?').run(s.id);
+        else { error = e.message; console.error('Échec d\'envoi de notification :', e.message); }
+      }
     }
-    q('INSERT INTO sms_log (direction, kind, phone, body, change_id, provider_id, error) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run('out', kind, phone, body, changeId, providerId, error);
-    return { ok: !error, error };
+    q('INSERT INTO notif_log (kind, audience, title, body, change_id, delivered, error) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(kind, audience, payload.title, payload.body || '', changeId, delivered, error);
+    return { ok: delivered > 0, delivered, error };
   }
+  function saveSubscription({ organizerId = null, coparentId = null }, sub) {
+    const p256dh = sub?.keys?.p256dh;
+    const auth = sub?.keys?.auth;
+    let endpoint;
+    try { endpoint = new URL(sub?.endpoint).href; } catch { return false; }
+    if (!endpoint.startsWith('https://') || !p256dh || !auth) return false;
+    q(`INSERT INTO push_subscriptions (organizer_id, coparent_id, endpoint, p256dh, auth) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(endpoint) DO UPDATE SET organizer_id = excluded.organizer_id, coparent_id = excluded.coparent_id,
+         p256dh = excluded.p256dh, auth = excluded.auth`).run(organizerId, coparentId, endpoint, p256dh, auth);
+    return true;
+  }
+  const removeSubscription = ({ organizerId = null, coparentId = null }, endpoint) => {
+    const col = organizerId ? 'organizer_id' : 'coparent_id';
+    q(`DELETE FROM push_subscriptions WHERE endpoint = ? AND ${col} = ?`).run(String(endpoint), organizerId || coparentId);
+  };
+  const deviceCount = (audience, id) =>
+    q(`SELECT COUNT(*) AS n FROM push_subscriptions WHERE ${audience === 'organizer' ? 'organizer_id' : 'coparent_id'} = ?`).get(id).n;
 
-  // --- Proches : rôle + code d'invitation, jamais de nom ----------------------------------
+  // --- Proches : rôle + code d'invitation, puis page personnelle ---------------------------
   const CLAIM_DAYS = 14;
+  // Proches et enfants partagent le même espace de codes : /j n'a pas à deviner de qui il s'agit.
   function freshClaimCode() {
     for (;;) {
       const code = newCode(CLAIM_LENGTH);
-      if (!q('SELECT 1 FROM coparents WHERE claim_code = ?').get(code)) return code;
+      if (!q('SELECT 1 FROM coparents WHERE claim_code = ?').get(code) && !q('SELECT 1 FROM children WHERE claim_code = ?').get(code)) return code;
     }
   }
+  const TABLES = { coparent: 'coparents', child: 'children' };
   function addCoparent(organizerId, role) {
     const taken = q('SELECT role FROM coparents WHERE organizer_id = ?').all(organizerId).map((r) => r.role);
     const finalRole = uniqueRole(role, taken);
@@ -47,52 +65,69 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
                  VALUES (?, ?, ?, datetime('now', '+${CLAIM_DAYS} days'))`).run(organizerId, finalRole, freshClaimCode());
     return { id: Number(r.lastInsertRowid), role: finalRole };
   }
-  // Nouveau code : l'ancien numéro est oublié, le proche se ré-enregistre (changement de numéro).
-  function renewClaim(organizerId, id) {
-    const r = q(`UPDATE coparents SET phone = NULL, claim_code = ?, claim_expires_at = datetime('now', '+${CLAIM_DAYS} days')
+  function addChild(organizerId, name) {
+    const r = q(`INSERT INTO children (organizer_id, name, claim_code, claim_expires_at)
+                 VALUES (?, ?, ?, datetime('now', '+${CLAIM_DAYS} days'))`).run(organizerId, name, freshClaimCode());
+    return Number(r.lastInsertRowid);
+  }
+  // Nouveau code : l'ancienne page et les appareils abonnés sont oubliés, la personne se ré-enregistre.
+  function renewClaim(organizerId, id, kind = 'coparent') {
+    const r = q(`UPDATE ${TABLES[kind]} SET page_hash = NULL, claim_code = ?, claim_expires_at = datetime('now', '+${CLAIM_DAYS} days')
                  WHERE id = ? AND organizer_id = ?`).run(freshClaimCode(), id, organizerId);
+    if (r.changes === 1 && kind === 'coparent') q('DELETE FROM push_subscriptions WHERE coparent_id = ?').run(id);
     return r.changes === 1;
   }
+  // Renvoie { kind, id, label, organizer_role } : label = rôle du proche, ou prénom de l'enfant.
   function findInvitation(code) {
     const c = parseCode(code, CLAIM_LENGTH);
     if (!c) return null;
-    return q(`SELECT p.id, p.role, o.role AS organizer_role FROM coparents p JOIN organizers o ON o.id = p.organizer_id
-              WHERE p.claim_code = ? AND p.claim_expires_at > datetime('now')`).get(c) || null;
+    const parent = q(`SELECT p.id, p.role AS label, o.role AS organizer_role FROM coparents p JOIN organizers o ON o.id = p.organizer_id
+                      WHERE p.claim_code = ? AND p.claim_expires_at > datetime('now')`).get(c);
+    if (parent) return { kind: 'coparent', ...parent };
+    const kid = q(`SELECT k.id, k.name AS label, o.role AS organizer_role FROM children k JOIN organizers o ON o.id = k.organizer_id
+                   WHERE k.claim_code = ? AND k.claim_expires_at > datetime('now')`).get(c);
+    return kid ? { kind: 'child', ...kid } : null;
   }
-  // Déclare « ce numéro est ce rôle ». Le code ne sert qu'une fois (mise à jour atomique).
-  function claim(code, rawPhone) {
-    const phone = normalizePhone(rawPhone);
+  // Déclare « ce lien (cet appareil) est ce rôle ». Le code ne sert qu'une fois (mise à jour atomique).
+  // Le lien secret n'est renvoyé qu'ici : seule son empreinte est gardée.
+  function claim(code) {
     const c = parseCode(code, CLAIM_LENGTH);
-    if (!phone) return { ok: false, error: 'phone' };
-    if (!c) return { ok: false, error: 'code' };
-    const row = findInvitation(c);
-    if (!row) return { ok: false, error: 'code' };
-    const r = q(`UPDATE coparents SET phone = ?, claim_code = NULL, claim_expires_at = NULL
-                 WHERE id = ? AND claim_code = ?`).run(phone, row.id, c);
-    if (r.changes !== 1) return { ok: false, error: 'code' };
-    return { ok: true, phone, role: row.role, organizerRole: row.organizer_role };
+    const row = c && findInvitation(c);
+    if (!row) return { ok: false };
+    const token = newToken(18);
+    const r = q(`UPDATE ${TABLES[row.kind]} SET page_hash = ?, claim_code = NULL, claim_expires_at = NULL
+                 WHERE id = ? AND claim_code = ?`).run(hashCode(token), row.id, c);
+    if (r.changes !== 1) return { ok: false };
+    return { ok: true, token, kind: row.kind, label: row.label, organizerRole: row.organizer_role };
   }
-  async function claimAndConfirm(code, rawPhone) {
-    const res = claim(code, rawPhone);
-    if (res.ok) {
-      await sendSms(res.phone, `Deux Toits : ce numéro est enregistré comme « ${res.role} ». ${sms.canReceive ? 'STOP pour ne plus recevoir ces messages.' : `Ne plus recevoir ces messages : ${baseUrl}/j`}`,
-        { kind: 'system' });
-    }
-    return res;
+  function childByToken(token) {
+    const t = String(token || '');
+    if (t.length < 16 || t.length > 64) return null;
+    return q(`SELECT k.id, k.name, k.organizer_id, o.role AS organizer_role FROM children k
+              JOIN organizers o ON o.id = k.organizer_id WHERE k.page_hash = ?`).get(hashCode(t)) || null;
+  }
+  function leaveChild(childId) {
+    q('UPDATE children SET page_hash = NULL, claim_code = NULL, claim_expires_at = NULL WHERE id = ?').run(childId);
+  }
+  function memberByToken(token) {
+    const t = String(token || '');
+    if (t.length < 16 || t.length > 64) return null;
+    return q(`SELECT p.id, p.role, p.organizer_id, o.role AS organizer_role FROM coparents p
+              JOIN organizers o ON o.id = p.organizer_id WHERE p.page_hash = ?`).get(hashCode(t)) || null;
+  }
+  // Le proche quitte : sa page et ses appareils sont oubliés ; l'organisateur peut lui créer un nouveau code.
+  function leave(coparentId) {
+    q('UPDATE coparents SET page_hash = NULL, claim_code = NULL, claim_expires_at = NULL WHERE id = ?').run(coparentId);
+    q('DELETE FROM push_subscriptions WHERE coparent_id = ?').run(coparentId);
   }
 
   function getChange(id) {
     const c = q('SELECT * FROM changes WHERE id = ?').get(id);
     return c ? hydrate(c) : null;
   }
-  function getChangeByToken(token) {
-    const c = q('SELECT * FROM changes WHERE token = ?').get(String(token));
-    return c ? hydrate(c) : null;
-  }
   function hydrate(c) {
     const kids = q(`SELECT ch.* FROM children ch JOIN change_children cc ON cc.child_id = ch.id
                     WHERE cc.change_id = ? ORDER BY ch.name`).all(c.id);
-    const coparent = q('SELECT * FROM coparents WHERE id = ?').get(c.coparent_id);
     return {
       ...c,
       items: JSON.parse(c.items),
@@ -100,53 +135,54 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
       kids,
       kidNames: joinFr(kids.map((k) => k.name)),
       isPast: c.date < today(),
-      organizer: q('SELECT id, role, phone FROM organizers WHERE id = ?').get(c.organizer_id),
-      coparent: { ...coparent, opted_out: isOptedOut(coparent.phone) }
+      organizer: q('SELECT id, role FROM organizers WHERE id = ?').get(c.organizer_id),
+      coparent: q('SELECT id, role FROM coparents WHERE id = ?').get(c.coparent_id)
     };
   }
+  // Demandes à venir d'un proche, pour sa page personnelle.
+  function changesForMember(coparentId) {
+    return q(`SELECT id FROM changes WHERE coparent_id = ? AND status != 'cancelled' AND date >= ?
+              ORDER BY date, time`).all(coparentId, today()).map((r) => getChange(r.id));
+  }
 
-  // --- Textes des SMS ------------------------------------------------------------
-  // Un lieu lié à la santé (pédiatre, pharmacie…) n'apparaît jamais dans un SMS.
-  const smsPlace = (place) => (place && !isHealthItem(place) ? place : null);
+  // --- Textes des notifications ------------------------------------------------------
+  // Un lieu lié à la santé (pédiatre, pharmacie…) n'apparaît jamais dans une notification.
+  const safePlace = (place) => (place && !isHealthItem(place) ? place : null);
   function describe(c) {
-    const place = smsPlace(c.place);
+    const place = safePlace(c.place);
     if (c.kind === 'pickup') {
       return `récupérer ${c.kidNames} ${frDate(c.date)}${c.time ? ` à ${frTime(c.time)}` : ''}${place ? ` à ${place}` : ''}`;
     }
     return `garder ${c.kidNames} ${frDate(c.date)}${c.time ? ` à partir de ${frTime(c.time)}` : ''}${place ? ` (${place})` : ''}`;
   }
-  function stopLine(c) {
-    return sms.canReceive ? 'STOP pour ne plus recevoir ces messages.' : `Ne plus recevoir ces messages : ${baseUrl}/r/${c.token}`;
+  function askPayload(c) {
+    return {
+      title: `${c.organizer.role} : peux-tu ${describe(c)} ?`,
+      body: c.items.length ? `À prévoir : ${joinFr(c.items)}.` : 'Ouvre ta page pour répondre.',
+      actions: [{ action: 'yes', title: 'Oui' }, { action: 'no', title: 'Non' }]
+    };
   }
-  function askText(c) {
-    const link = `${baseUrl}/r/${c.token}`;
-    const lines = [`${c.organizer.role} : peux-tu ${describe(c)} ?${c.items.length ? ` À prévoir : ${joinFr(c.items)}.` : ''}`];
-    if (sms.canReceive) lines.push(`Réponds OUI ou NON à ce SMS. Pour proposer autre chose : ${link}`);
-    else lines.push(`Pour répondre : ${link}`);
-    lines.push(stopLine(c));
-    return lines.join('\n');
-  }
-  function reminderText(c) {
-    const place = smsPlace(c.place);
+  function reminderPayload(c) {
+    const place = safePlace(c.place);
     const what = c.kind === 'pickup'
       ? `Vous récupérez ${c.kidNames}${c.time ? ` à ${frTime(c.time)}` : ''}${place ? ` à ${place}` : ''}.`
       : `Vous gardez ${c.kidNames}${c.time ? ` à partir de ${frTime(c.time)}` : ''}.`;
-    return [`Rappel de ${c.organizer.role} : demain, ${frDate(c.date)}.`, `${what} À prévoir : ${joinFr(c.items)}.`, stopLine(c)].join('\n');
+    return { title: `Rappel de ${c.organizer.role} : demain, ${frDate(c.date)}.`, body: `${what} À prévoir : ${joinFr(c.items)}.` };
   }
-  function answerText(c) {
+  function answerPayload(c) {
     const who = c.coparent.role;
     const when = frDate(c.date);
-    if (c.status === 'accepted') return `Deux Toits : ${who} a répondu OUI pour ${when}.`;
-    if (c.status === 'declined') return `Deux Toits : ${who} ne peut pas pour ${when}. ${baseUrl}/`;
-    if (c.status === 'counter') return `Deux Toits : ${who} répond « ${c.counter_label} » pour ${when}. Pour accepter : ${baseUrl}/changes/${c.id}`;
-    return '';
+    if (c.status === 'accepted') return { title: `Deux Toits : ${who} a répondu OUI pour ${when}.` };
+    if (c.status === 'declined') return { title: `Deux Toits : ${who} ne peut pas pour ${when}.`, body: 'Ouvrez Deux Toits pour voir la suite.' };
+    if (c.status === 'counter') return { title: `Deux Toits : ${who} répond « ${c.counter_label} » pour ${when}.`, body: 'Ouvrez le changement pour accepter.' };
+    return { title: '' };
   }
 
   // --- Création et envoi ---------------------------------------------------------
   function parseInput(organizerId, input) {
-    const coparent = q('SELECT * FROM coparents WHERE id = ? AND organizer_id = ?').get(Number(input.coparentId), organizerId);
+    const coparent = q('SELECT id, role, page_hash FROM coparents WHERE id = ? AND organizer_id = ?').get(Number(input.coparentId), organizerId);
     if (!coparent) throw new UserError('Choisissez le parent à prévenir.');
-    if (!coparent.phone) throw new UserError(`${coparent.role} n'a pas encore enregistré son numéro. Montrez-lui son QR code ou donnez-lui son code (page Famille).`);
+    if (!coparent.page_hash) throw new UserError(`${coparent.role} n'a pas encore rejoint. Montrez-lui son QR code ou donnez-lui son code (page Famille).`);
     const childIds = [].concat(input.childIds || []).map(Number).filter(Boolean);
     const kids = childIds.length
       ? q(`SELECT * FROM children WHERE organizer_id = ? AND id IN (${childIds.map(() => '?').join(',')})`).all(organizerId, ...childIds)
@@ -164,28 +200,25 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
 
   async function createChange(organizerId, input) {
     const p = parseInput(organizerId, input);
-    const token = newToken();
-    const r = q(`INSERT INTO changes (organizer_id, coparent_id, kind, date, time, place, items, private_items, token)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(organizerId, p.coparent.id, p.kind, p.date, p.time, p.place, JSON.stringify(p.items), JSON.stringify(p.privateItems), token);
+    const r = q(`INSERT INTO changes (organizer_id, coparent_id, kind, date, time, place, items, private_items)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(organizerId, p.coparent.id, p.kind, p.date, p.time, p.place, JSON.stringify(p.items), JSON.stringify(p.privateItems));
     const id = Number(r.lastInsertRowid);
     for (const k of p.kids) q('INSERT INTO change_children (change_id, child_id) VALUES (?, ?)').run(id, k.id);
 
     const change = getChange(id);
-    if (change.coparent.opted_out) {
-      return { change, sent: false, reason: `${p.coparent.role} a demandé à ne plus recevoir de SMS. Prévenez-le autrement.` };
-    }
-    const res = await sendSms(p.coparent.phone, askText(change), { changeId: id, kind: 'ask' });
+    const res = await notify('coparent', p.coparent.id, askPayload(change), { changeId: id, kind: 'ask' });
     return { change, sent: res.ok, reason: res.error };
   }
 
   // Aperçu sans rien enregistrer. Lève UserError si la saisie est incomplète.
   function previewText(organizerId, input) {
     const p = parseInput(organizerId, input);
-    return askText({
-      ...p, kidNames: joinFr(p.kids.map((k) => k.name)), token: 'xxxxxx',
-      organizer: q('SELECT id, role, phone FROM organizers WHERE id = ?').get(organizerId)
+    const payload = askPayload({
+      ...p, kidNames: joinFr(p.kids.map((k) => k.name)),
+      organizer: q('SELECT id, role FROM organizers WHERE id = ?').get(organizerId)
     });
+    return `${payload.title}\n${payload.body}`;
   }
 
   // --- Réponses de l'autre parent ------------------------------------------------------
@@ -210,12 +243,12 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
       if (!counter) return { ok: false, message: 'Réponse non reconnue.' };
       status = 'counter';
     }
-    // Mise à jour conditionnelle : une seule réponse compte, même si le lien et le SMS arrivent ensemble.
+    // Mise à jour conditionnelle : une seule réponse compte, même si deux appareils répondent ensemble.
     const r = q(`UPDATE changes SET status = ?, counter_label = ?, counter_choice = ?, responded_at = datetime('now')
                  WHERE id = ? AND status = 'pending'`).run(status, counter?.label ?? null, counter?.id ?? null, change.id);
     if (r.changes !== 1) return { ok: false, message: 'Une réponse a déjà été donnée.', change: getChange(change.id) };
     const updated = getChange(change.id);
-    await sendSms(updated.organizer.phone, answerText(updated), { changeId: updated.id, kind: 'answer' });
+    await notify('organizer', updated.organizer_id, answerPayload(updated), { changeId: updated.id, kind: 'answer' });
     return { ok: true, change: updated };
   }
 
@@ -231,7 +264,7 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
                  WHERE id = ? AND status = 'counter'`).run(date, time, c.id);
     if (r.changes !== 1) return { ok: false };
     const updated = getChange(c.id);
-    await sendSms(updated.coparent.phone, `${updated.organizer.role} : c'est d'accord, tu peux ${describe(updated)}. Merci !`,
+    await notify('coparent', updated.coparent_id, { title: `${updated.organizer.role} : c'est d'accord, tu peux ${describe(updated)}. Merci !` },
       { changeId: c.id, kind: 'confirm' });
     return { ok: true, change: updated };
   }
@@ -243,60 +276,12 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
     if (r.changes !== 1) return { ok: true, notified: false };
     // On ne dérange l'autre parent que si la demande le concernait encore.
     if (!c.isPast && c.status !== 'declined') {
-      await sendSms(c.coparent.phone, `${c.organizer.role} : finalement, le changement prévu ${frDate(c.date)} est annulé. Rien à faire.`,
+      const res = await notify('coparent', c.coparent_id,
+        { title: `${c.organizer.role} : finalement, le changement prévu ${frDate(c.date)} est annulé.`, body: 'Rien à faire.' },
         { changeId: c.id, kind: 'cancel' });
-      return { ok: true, notified: true };
+      return { ok: true, notified: res.ok };
     }
     return { ok: true, notified: false };
-  }
-
-  // --- SMS entrants (OUI / NON / STOP) ---------------------------------------------------
-  function parseReply(body) {
-    const t = String(body || '').trim().toUpperCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[.!\s]+$/g, '');
-    if (/^(STOP|ARRET|STOPALL|UNSUBSCRIBE)$/.test(t)) return 'stop';
-    if (/^START$/.test(t)) return 'start';
-    if (/^(OUI|O|OK|D'?ACCORD|YES|Y|OUAIS|CA MARCHE|C'?EST NOTE|NOTE)$/.test(t)) return 'yes';
-    if (/^(NON|N|NO|PAS POSSIBLE|IMPOSSIBLE)$/.test(t)) return 'no';
-    return null;
-  }
-
-  async function handleInbound(rawPhone, body) {
-    const phone = normalizePhone(rawPhone) || String(rawPhone);
-    q('INSERT INTO sms_log (direction, kind, phone, body) VALUES (?, ?, ?, ?)').run('in', 'reply', phone, String(body).slice(0, 500));
-    // Un SMS qui contient un code d'invitation enregistre l'expéditeur : l'opérateur garantit le numéro.
-    const codeFromSms = parseCode(body, CLAIM_LENGTH);
-    if (codeFromSms) {
-      const res = claim(codeFromSms, phone);
-      if (res.ok) {
-        optIn(phone); // le proche vient d'écrire lui-même : il veut recevoir les messages
-        return { action: 'claim', reply: `C'est enregistré : ce numéro est « ${res.role} ». Vous recevrez les changements de planning de ${res.organizerRole}. STOP pour arrêter.` };
-      }
-    }
-    const intent = parseReply(body);
-
-    if (intent === 'stop') {
-      optOut(phone);
-      return { action: 'stop', reply: 'Vous ne recevrez plus de messages de Deux Toits. Envoyez START pour les réactiver.' };
-    }
-    if (intent === 'start') {
-      optIn(phone);
-      return { action: 'start', reply: 'Les messages de Deux Toits sont réactivés.' };
-    }
-
-    // OUI/NON ne s'applique qu'à la demande à laquelle le dernier SMS reçu par ce numéro posait la question.
-    // Un « ok » envoyé après un rappel ou une annulation n'accepte donc rien par erreur.
-    const last = q(`SELECT kind, change_id FROM sms_log WHERE direction = 'out' AND phone = ? ORDER BY id DESC LIMIT 1`).get(phone);
-    const target = last?.kind === 'ask' && last.change_id ? getChange(last.change_id) : null;
-    if (target && target.status === 'pending' && !target.isPast && intent) {
-      const r = await respond(target, intent);
-      if (r.ok) return { action: intent, reply: intent === 'yes' ? 'Merci, c\'est noté.' : 'Merci, la réponse a été transmise.' };
-    }
-
-    const pending = q(`SELECT c.id FROM changes c JOIN coparents p ON p.id = c.coparent_id
-                       WHERE p.phone = ? AND c.status = 'pending' AND c.date >= ? ORDER BY c.id DESC LIMIT 1`).get(phone, today());
-    if (!pending) return { action: 'none', reply: null };
-    const c = getChange(pending.id);
-    return { action: 'unknown', reply: `Pour répondre à la demande de ${c.organizer.role} (${frDate(c.date)}) : ${baseUrl}/r/${c.token}` };
   }
 
   // --- Rappels de la veille ----------------------------------------------------------------
@@ -315,8 +300,7 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
       let sent = 0;
       for (const { id } of due) {
         const c = getChange(id);
-        if (c.coparent.opted_out) continue;
-        const res = await sendSms(c.coparent.phone, reminderText(c), { changeId: id, kind: 'reminder' });
+        const res = await notify('coparent', c.coparent_id, reminderPayload(c), { changeId: id, kind: 'reminder' });
         if (res.ok) sent++;
         else q('UPDATE changes SET reminder_sent_at = NULL WHERE id = ?').run(id); // nouvel essai à la passe suivante
       }
@@ -333,13 +317,15 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
     const week = Math.floor(diff / 7);
     return ((week % 2) + 2) % 2 === 0 ? 'organizer' : 'coparent';
   }
-  function week(organizerId, startIso) {
+  // Pour la page d'un enfant : seulement les changements qui le concernent (childId), sur `count` jours.
+  function week(organizerId, startIso, { childId = null, count = 7 } = {}) {
     const org = q('SELECT * FROM organizers WHERE id = ?').get(organizerId);
     const days = [];
-    for (let i = 0; i < 7; i++) {
+    for (let i = 0; i < count; i++) {
       const date = addDays(startIso, i);
       const changes = q(`SELECT id FROM changes WHERE organizer_id = ? AND date = ? AND status != 'cancelled'
-                         ORDER BY time`).all(organizerId, date).map((r) => getChange(r.id));
+                         ${childId ? 'AND id IN (SELECT change_id FROM change_children WHERE child_id = ?)' : ''}
+                         ORDER BY time`).all(...[organizerId, date, ...(childId ? [childId] : [])]).map((r) => getChange(r.id));
       const accepted = changes.filter((c) => c.status === 'accepted');
       let home = homeOn(org, date);
       const notes = [];
@@ -355,9 +341,9 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
   }
 
   return {
-    createChange, previewText, getChange, getChangeByToken, respond, acceptCounter, cancelChange, counterOptions,
-    handleInbound, parseReply, runReminders, week, sendSms, isOptedOut, optOut,
-    addCoparent, renewClaim, findInvitation, claim, claimAndConfirm
+    createChange, previewText, getChange, changesForMember, respond, acceptCounter, cancelChange, counterOptions,
+    runReminders, week, notify, saveSubscription, removeSubscription, deviceCount,
+    addCoparent, addChild, renewClaim, findInvitation, claim, memberByToken, childByToken, leave, leaveChild
   };
 }
 

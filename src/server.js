@@ -1,20 +1,19 @@
 import express from 'express';
-import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb } from './db.js';
-import { createSmsProvider } from './sms.js';
+import { createPushProvider } from './push.js';
 import { createService, UserError } from './service.js';
 import QRCode from 'qrcode';
 import {
-  ACCESS_LENGTH, ROLES, groupCode, hashCode, isRole, isValidDate, localParts, newCode, newToken, normalizePhone, parseCode, splitItems
+  ACCESS_LENGTH, ROLES, groupCode, hashCode, isRole, isValidDate, localParts, newCode, newToken, parseCode, splitItems
 } from './util.js';
 import * as V from './views.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export function createApp({ db, sms, baseUrl }) {
-  const svc = createService({ db, sms, baseUrl });
+export function createApp({ db, push, baseUrl }) {
+  const svc = createService({ db, push });
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
@@ -25,6 +24,7 @@ export function createApp({ db, sms, baseUrl }) {
     res.set('X-Content-Type-Options', 'nosniff');
     res.set('Referrer-Policy', 'no-referrer');
     res.set('X-Frame-Options', 'DENY');
+    res.set('X-Robots-Tag', 'noindex');
     next();
   });
 
@@ -85,12 +85,10 @@ export function createApp({ db, sms, baseUrl }) {
   app.get('/signup', (req, res) => res.send(V.authPage({ mode: 'signup' })));
   app.post('/signup', (req, res) => {
     const role = String(req.body.role || '');
-    const phone = normalizePhone(req.body.phone);
-    const values = { role, phone: req.body.phone };
+    const values = { role };
     if (!isRole(role)) return res.status(400).send(V.authPage({ mode: 'signup', error: 'Choisissez votre rôle dans la liste.', values }));
-    if (!phone) return res.status(400).send(V.authPage({ mode: 'signup', error: 'Ce numéro de téléphone n\'est pas reconnu.', values }));
     const placeholder = hashCode(newToken(24)); // remplacé aussitôt par l'empreinte du vrai code
-    const r = db.prepare('INSERT INTO organizers (role, phone, access_hash) VALUES (?, ?, ?)').run(role, phone, placeholder);
+    const r = db.prepare('INSERT INTO organizers (role, access_hash) VALUES (?, ?)').run(role, placeholder);
     const id = Number(r.lastInsertRowid);
     const code = issueAccessCode(id);
     startSession(res, id);
@@ -122,31 +120,76 @@ export function createApp({ db, sms, baseUrl }) {
     noStore(res).send(V.accessCodePage({ code, first: false }));
   });
 
-  // --- Invitation d'un proche : « ce numéro est ce rôle » ------------------------------------
-  // Le lien (QR code en présentiel) contient le code ; sans lien, on tape le code sur /j.
-  const joinPage = (res, status, { code = '', invitation = null, error, phone = '' }) =>
-    noStore(res).status(status).send(V.joinPage({ code, invitation, error, phone }));
+  // Appareils de l'organisateur abonnés aux notifications (Web Push).
+  app.post('/push', auth, (req, res) => (svc.saveSubscription({ organizerId: req.org.id }, req.body) ? res.sendStatus(204) : res.sendStatus(400)));
+  app.post('/push/delete', auth, (req, res) => { svc.removeSubscription({ organizerId: req.org.id }, req.body.endpoint); res.sendStatus(204); });
+
+  // --- Invitation d'un proche : « cet appareil est ce rôle » ---------------------------------
+  // Le lien (QR code en présentiel) contient le code ; sans lien, on tape le code sur /j. Aucun numéro, aucun nom.
+  const joinPage = (res, status, { code = '', invitation = null, error }) =>
+    noStore(res).status(status).send(V.joinPage({ code, invitation, error }));
   app.get('/j', (req, res) => joinPage(res, 200, {}));
   app.get('/j/:code', (req, res) => {
     const invitation = svc.findInvitation(req.params.code);
     if (!invitation) return joinPage(res, 404, { error: 'Ce code n\'est pas valable ou a expiré. Demandez-en un nouveau.' });
     joinPage(res, 200, { code: req.params.code, invitation });
   });
-  app.post('/j', wrap(async (req, res) => {
+  app.post('/j', (req, res) => {
     const key = `ip:${req.ip}`;
     const code = String(req.body.code || '');
-    const phone = String(req.body.phone || '');
-    if (tooMany(key)) return joinPage(res, 429, { code, phone, error: 'Trop de tentatives. Réessayez dans 15 minutes.' });
-    const r = await svc.claimAndConfirm(code, phone);
+    if (tooMany(key)) return joinPage(res, 429, { code, error: 'Trop de tentatives. Réessayez dans 15 minutes.' });
+    const r = svc.claim(code);
     if (!r.ok) {
-      if (r.error === 'code') record(key);
-      return joinPage(res, 400, {
-        code, phone, invitation: svc.findInvitation(code),
-        error: r.error === 'phone' ? 'Ce numéro de téléphone n\'est pas reconnu.' : 'Ce code n\'est pas valable ou a expiré.'
-      });
+      record(key);
+      return joinPage(res, 400, { code, invitation: svc.findInvitation(code), error: 'Ce code n\'est pas valable ou a expiré.' });
     }
-    noStore(res).send(V.joinedPage({ role: r.role, organizerRole: r.organizerRole, canReceive: sms.canReceive }));
+    // La page personnelle est le lien secret : à mettre en favori ou sur l'écran d'accueil.
+    noStore(res).redirect(`/${r.kind === 'child' ? 'e' : 'm'}/${r.token}?bienvenue=1`);
+  });
+
+  // --- Page personnelle d'un proche : lien secret, aucun compte ---------------------------------
+  const memberOf = (req, res, next) => {
+    const member = svc.memberByToken(req.params.token);
+    if (!member) return noStore(res).status(404).send(V.notFoundPage('Ce lien n\'est plus valable. Demandez un nouveau code à l\'organisateur.'));
+    req.member = member;
+    noStore(res);
+    next();
+  };
+  const memberUrl = (req) => `/m/${req.params.token}`;
+  app.get('/m/:token', memberOf, (req, res) => {
+    const changes = svc.changesForMember(req.member.id).map((c) => ({ ...c, options: c.status === 'pending' ? svc.counterOptions(c) : [] }));
+    res.send(V.memberPage({
+      member: req.member, base: memberUrl(req), changes, flash: parseFlash(req),
+      devices: svc.deviceCount('coparent', req.member.id), publicKey: push.publicKey,
+      focus: Number(req.query.c) || null, welcome: req.query.bienvenue === '1'
+    }));
+  });
+  app.post('/m/:token/changes/:id/answer', memberOf, wrap(async (req, res) => {
+    const change = svc.getChange(Number(req.params.id));
+    if (!change || change.coparent_id !== req.member.id) return res.status(404).send(V.notFoundPage());
+    const r = await svc.respond(change, String(req.body.answer || ''));
+    // Les boutons de la notification répondent en JSON ; la page, en formulaire.
+    if (req.is('json')) return res.status(r.ok ? 200 : 409).json({ ok: r.ok, message: r.message });
+    if (!r.ok) flash(res, 'error', r.message);
+    else flash(res, 'ok', 'Réponse envoyée.');
+    res.redirect(memberUrl(req));
   }));
+  app.post('/m/:token/push', memberOf, (req, res) => (svc.saveSubscription({ coparentId: req.member.id }, req.body) ? res.sendStatus(204) : res.sendStatus(400)));
+  app.post('/m/:token/push/delete', memberOf, (req, res) => { svc.removeSubscription({ coparentId: req.member.id }, req.body.endpoint); res.sendStatus(204); });
+  app.post('/m/:token/leave', memberOf, (req, res) => {
+    svc.leave(req.member.id);
+    res.send(V.notFoundPage('C\'est fait : cette page et vos appareils sont oubliés. Plus aucune notification ne sera envoyée.').replace('Introuvable', 'Au revoir'));
+  });
+  // Le service worker et le manifeste sont servis sous la page : leur portée est la page du proche seule.
+  app.get('/m/:token/sw.js', memberOf, (req, res) => {
+    res.type('application/javascript').set('Cache-Control', 'no-cache').sendFile(path.join(__dirname, '..', 'public', 'sw.js'));
+  });
+  app.get('/m/:token/manifest.webmanifest', memberOf, (req, res) => {
+    res.type('application/manifest+json').json({
+      name: 'Deux Toits', short_name: 'Deux Toits', lang: 'fr', start_url: './', scope: './', display: 'standalone',
+      background_color: '#F3F5F7', theme_color: '#0E6B6B', icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' }]
+    });
+  });
 
   // --- Accueil -------------------------------------------------------------------
   app.get('/', auth, (req, res) => {
@@ -157,31 +200,39 @@ export function createApp({ db, sms, baseUrl }) {
                                ORDER BY date LIMIT 10`).all(req.org.id, today).map((r) => svc.getChange(r.id));
     res.send(V.homePage({
       org: req.org, week: svc.week(req.org.id, today), recent,
-      setupNeeded: !kids.length || !coparents.length, flash: parseFlash(req)
+      setupNeeded: !kids.length || !coparents.length, flash: parseFlash(req),
+      noDevice: svc.deviceCount('organizer', req.org.id) === 0
     }));
   });
 
   // --- Famille -------------------------------------------------------------------
   app.get('/famille', auth, wrap(async (req, res) => {
-    const coparents = db.prepare('SELECT * FROM coparents WHERE organizer_id = ? ORDER BY id').all(req.org.id);
     // QR codes générés ici, en SVG : le code d'invitation ne quitte jamais le serveur.
-    const members = await Promise.all(coparents.map(async (p) => {
-      const link = p.claim_code ? `${baseUrl}/j/${p.claim_code}` : null;
+    const withInvite = async (row, devices) => {
+      const link = row.claim_code ? `${baseUrl}/j/${row.claim_code}` : null;
       return {
-        ...p, opted_out: svc.isOptedOut(p.phone), link,
-        codeLabel: p.claim_code ? groupCode(p.claim_code) : null,
+        ...row, joined: !!row.page_hash, devices, link,
+        codeLabel: row.claim_code ? groupCode(row.claim_code) : null,
         qr: link ? await QRCode.toString(link, { type: 'svg', margin: 1, errorCorrectionLevel: 'M' }) : null
       };
-    }));
+    };
+    const coparents = db.prepare('SELECT * FROM coparents WHERE organizer_id = ? ORDER BY id').all(req.org.id);
+    const kids = db.prepare('SELECT * FROM children WHERE organizer_id = ? ORDER BY name').all(req.org.id);
     noStore(res).send(V.familyPage({
       org: req.org,
-      kids: db.prepare('SELECT * FROM children WHERE organizer_id = ? ORDER BY name').all(req.org.id),
-      coparents: members, roles: ROLES, flash: parseFlash(req), joinUrl: `${baseUrl}/j`
+      kids: await Promise.all(kids.map((k) => withInvite(k, 0))),
+      coparents: await Promise.all(coparents.map((p) => withInvite(p, svc.deviceCount('coparent', p.id)))), roles: ROLES, flash: parseFlash(req), joinUrl: `${baseUrl}/j`,
+      devices: svc.deviceCount('organizer', req.org.id), publicKey: push.publicKey
     }));
   }));
   app.post('/famille/enfants', auth, (req, res) => {
     const name = String(req.body.name || '').trim().slice(0, 30);
-    if (name) db.prepare('INSERT INTO children (organizer_id, name) VALUES (?, ?)').run(req.org.id, name);
+    if (name) svc.addChild(req.org.id, name);
+    res.redirect('/famille');
+  });
+  app.post('/famille/enfants/:id/code', auth, (req, res) => {
+    const ok = svc.renewClaim(req.org.id, Number(req.params.id), 'child');
+    flash(res, ok ? 'ok' : 'error', ok ? 'Nouveau code créé. L\'ancienne page de l\'enfant est oubliée.' : 'Introuvable.');
     res.redirect('/famille');
   });
   app.post('/famille/enfants/:id/supprimer', auth, (req, res) => {
@@ -192,12 +243,12 @@ export function createApp({ db, sms, baseUrl }) {
     const role = String(req.body.role || '');
     if (!isRole(role)) { flash(res, 'error', 'Choisissez un rôle dans la liste.'); return res.redirect('/famille'); }
     const added = svc.addCoparent(req.org.id, role);
-    flash(res, 'ok', `${added.role} est ajouté. Montrez-lui son QR code ou donnez-lui son code : c'est lui qui enregistrera son numéro.`);
+    flash(res, 'ok', `${added.role} est ajouté. Montrez-lui son QR code ou donnez-lui son code : c'est lui qui rejoint, depuis son appareil.`);
     res.redirect('/famille');
   });
   app.post('/famille/parents/:id/code', auth, (req, res) => {
     const ok = svc.renewClaim(req.org.id, Number(req.params.id));
-    flash(res, ok ? 'ok' : 'error', ok ? 'Nouveau code créé. L\'ancien numéro est oublié : la personne doit se ré-enregistrer.' : 'Introuvable.');
+    flash(res, ok ? 'ok' : 'error', ok ? 'Nouveau code créé. L\'ancienne page et les anciens appareils sont oubliés : la personne doit rejoindre à nouveau.' : 'Introuvable.');
     res.redirect('/famille');
   });
   app.post('/famille/parents/:id/supprimer', auth, (req, res) => {
@@ -237,7 +288,7 @@ export function createApp({ db, sms, baseUrl }) {
   app.post('/changes', auth, wrap(async (req, res) => {
     try {
       const { change, sent, reason } = await svc.createChange(req.org.id, pick(req.body));
-      flash(res, sent ? 'ok' : 'error', sent ? `SMS envoyé à ${change.coparent.role}.` : `Changement enregistré, mais le SMS n'est pas parti : ${reason}`);
+      flash(res, sent ? 'ok' : 'error', sent ? `Notification envoyée à ${change.coparent.role}.` : `Changement enregistré, mais aucune notification n'est partie (${reason}). ${change.coparent.role} verra la demande en ouvrant sa page.`);
       res.redirect(`/changes/${change.id}`);
     } catch (e) {
       if (!(e instanceof UserError)) throw e;
@@ -247,59 +298,44 @@ export function createApp({ db, sms, baseUrl }) {
   app.get('/changes/:id', auth, (req, res) => {
     const change = svc.getChange(Number(req.params.id));
     if (!change || change.organizer_id !== req.org.id) return res.status(404).send(V.notFoundPage());
-    const smsLog = db.prepare('SELECT * FROM sms_log WHERE change_id = ? ORDER BY id').all(change.id);
-    res.send(V.changePage({ change, smsLog, flash: parseFlash(req) }));
+    const notifs = db.prepare('SELECT * FROM notif_log WHERE change_id = ? ORDER BY id').all(change.id);
+    res.send(V.changePage({ change, notifs, flash: parseFlash(req) }));
   });
   app.post('/changes/:id/annuler', auth, wrap(async (req, res) => {
     const r = await svc.cancelChange(req.org.id, Number(req.params.id));
     if (!r.ok) return res.status(404).send(V.notFoundPage());
-    flash(res, 'ok', r.notified ? 'Changement annulé. L\'autre parent est prévenu par SMS.' : 'Changement annulé.');
+    flash(res, 'ok', r.notified ? 'Changement annulé. L\'autre parent est prévenu.' : 'Changement annulé.');
     res.redirect('/');
   }));
   app.post('/changes/:id/accepter-proposition', auth, wrap(async (req, res) => {
     const r = await svc.acceptCounter(req.org.id, Number(req.params.id));
-    flash(res, r.ok ? 'ok' : 'error', r.ok ? 'Proposition acceptée. L\'autre parent est prévenu par SMS.' : 'Cette proposition n\'est plus valable.');
+    flash(res, r.ok ? 'ok' : 'error', r.ok ? 'Proposition acceptée. L\'autre parent est prévenu.' : 'Cette proposition n\'est plus valable.');
     res.redirect(`/changes/${Number(req.params.id)}`);
   }));
 
-  // --- Réponse de l'autre parent, sans compte -------------------------------------------
-  const gone = (change) => !change || change.status === 'cancelled' || change.isPast;
-  const goneText = 'Cette demande a été annulée, est passée, ou n\'existe pas.';
-  app.get('/r/:token', (req, res) => {
-    const change = svc.getChangeByToken(req.params.token);
-    if (gone(change)) return res.status(404).send(V.notFoundPage(goneText));
-    res.send(V.replyPage({ change, options: svc.counterOptions(change), optedOut: svc.isOptedOut(change.coparent.phone) }));
+  // --- Page d'un enfant : calendrier en lecture seule, lien secret, aucun compte ---------------------
+  const childOf = (req, res, next) => {
+    const child = svc.childByToken(req.params.token);
+    if (!child) return noStore(res).status(404).send(V.notFoundPage('Ce lien n\'est plus valable. Demandez un nouveau code à l\'un des parents.'));
+    req.child = child;
+    noStore(res);
+    next();
+  };
+  app.get('/e/:token', childOf, (req, res) => {
+    const { date: today } = localParts();
+    const week = svc.week(req.child.organizer_id, today, { childId: req.child.id, count: 14 });
+    res.send(V.childPage({ child: req.child, week, base: `/e/${req.params.token}`, welcome: req.query.bienvenue === '1' }));
   });
-  app.post('/r/:token', wrap(async (req, res) => {
-    const change = svc.getChangeByToken(req.params.token);
-    if (gone(change)) return res.status(404).send(V.notFoundPage(goneText));
-    if (change.status !== 'pending') return res.send(V.replyPage({ change, options: [], done: true }));
-    const r = await svc.respond(change, String(req.body.answer || ''));
-    if (!r.ok) {
-      const current = r.change || change;
-      if (current.status !== 'pending') return res.send(V.replyPage({ change: current, options: [], done: true }));
-      return res.status(400).send(V.replyPage({ change, options: svc.counterOptions(change), flash: { type: 'error', text: r.message } }));
-    }
-    res.send(V.replyPage({ change: r.change, options: [], done: true }));
-  }));
-  // Désinscription sans SMS entrant (indispensable avec un expéditeur qui ne reçoit pas de réponse).
-  app.post('/r/:token/stop', (req, res) => {
-    const change = svc.getChangeByToken(req.params.token);
-    if (!change) return res.status(404).send(V.notFoundPage(goneText));
-    svc.optOut(change.coparent.phone);
-    res.send(V.notFoundPage('C\'est noté : vous ne recevrez plus de messages de Deux Toits.').replace('Introuvable', 'Désinscription'));
+  app.post('/e/:token/leave', childOf, (req, res) => {
+    svc.leaveChild(req.child.id);
+    res.send(V.notFoundPage('C\'est fait : cette page est oubliée.').replace('Introuvable', 'Au revoir'));
   });
-
-  // --- SMS entrants ------------------------------------------------------------------
-  // Twilio : configurer l'URL « A message comes in » sur /webhooks/sms/twilio (POST).
-  // La route n'existe qu'avec Twilio, et chaque requête doit porter une signature valide.
-  if (sms.name === 'twilio') {
-    app.post('/webhooks/sms/twilio', wrap(async (req, res) => {
-      if (!checkTwilioSignature(req, baseUrl)) return res.status(403).send('Signature invalide');
-      const r = await svc.handleInbound(req.body.From, req.body.Body);
-      res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?><Response>${r.reply ? `<Message>${xmlEsc(r.reply)}</Message>` : ''}</Response>`);
-    }));
-  }
+  app.get('/e/:token/manifest.webmanifest', childOf, (req, res) => {
+    res.type('application/manifest+json').json({
+      name: 'Deux Toits', short_name: 'Deux Toits', lang: 'fr', start_url: './', scope: './', display: 'standalone',
+      background_color: '#F3F5F7', theme_color: '#0E6B6B', icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' }]
+    });
+  });
 
   // --- Feuille à imprimer ---------------------------------------------------------------
   app.get('/semaine/imprimer', auth, (req, res) => {
@@ -310,25 +346,7 @@ export function createApp({ db, sms, baseUrl }) {
     }));
   });
 
-  // --- Outil de test, actif seulement en mode console -------------------------------------------
-  if (sms.name === 'console') {
-    app.get('/dev/sms', auth, (req, res) => {
-      const coparents = db.prepare('SELECT * FROM coparents WHERE organizer_id = ?').all(req.org.id);
-      const phones = [req.org.phone, ...coparents.map((p) => p.phone)].filter(Boolean);
-      const log = db.prepare(`SELECT * FROM sms_log WHERE phone IN (${phones.map(() => '?').join(',')}) ORDER BY id DESC LIMIT 50`).all(...phones);
-      res.send(V.devSmsPage({ log, coparents }));
-    });
-    app.post('/dev/sms', auth, wrap(async (req, res) => {
-      const owned = db.prepare('SELECT 1 FROM coparents WHERE organizer_id = ? AND phone = ?').get(req.org.id, req.body.from);
-      if (owned) {
-        const r = await svc.handleInbound(req.body.from, req.body.body);
-        if (r.reply) db.prepare('INSERT INTO sms_log (direction, kind, phone, body) VALUES (?, ?, ?, ?)').run('out', 'system', req.body.from, r.reply);
-      }
-      res.redirect('/dev/sms');
-    }));
-  }
-
-  app.get('/sante', (req, res) => res.json({ ok: true, sms: sms.name }));
+  app.get('/sante', (req, res) => res.json({ ok: true, push: push.name }));
   app.use((req, res) => res.status(404).send(V.notFoundPage()));
   app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
     console.error(err);
@@ -338,29 +356,14 @@ export function createApp({ db, sms, baseUrl }) {
   return { app, svc };
 }
 
-function xmlEsc(s) {
-  return String(s).replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[c]));
-}
-
-// Vérifie la signature X-Twilio-Signature (HMAC-SHA1 de l'URL + paramètres triés).
-function checkTwilioSignature(req, baseUrl) {
-  const token = process.env.TWILIO_AUTH_TOKEN;
-  if (!token) return false;
-  const url = baseUrl + req.originalUrl;
-  const data = Object.keys(req.body).sort().reduce((acc, k) => acc + k + req.body[k], url);
-  const expected = crypto.createHmac('sha1', token).update(data).digest('base64');
-  const got = req.get('X-Twilio-Signature') || '';
-  return got.length === expected.length && crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected));
-}
-
 // --- Démarrage --------------------------------------------------------------------------
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const port = Number(process.env.PORT || 3000);
   const baseUrl = (process.env.BASE_URL || `http://localhost:${port}`).replace(/\/$/, '');
   const db = openDb();
-  const sms = createSmsProvider();
-  const { app, svc } = createApp({ db, sms, baseUrl });
-  app.listen(port, () => console.log(`Deux Toits sur ${baseUrl} (SMS : ${sms.name})`));
+  const push = createPushProvider({ db, baseUrl });
+  const { app, svc } = createApp({ db, push, baseUrl });
+  app.listen(port, () => console.log(`Deux Toits sur ${baseUrl} (notifications : ${push.name})`));
   // Rappels de la veille : vérification chaque minute.
   setInterval(() => svc.runReminders().catch((e) => console.error('Rappels :', e)), 60_000);
 }
