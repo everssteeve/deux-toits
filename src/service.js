@@ -1,7 +1,7 @@
 // Logique métier : changements, réponses, SMS entrants, rappels, semaine.
 import {
-  addDays, frDate, frTime, isHealthItem, isValidDate, joinFr, localParts, newToken,
-  normalizePhone, shiftTime, splitItems, toMinutes
+  CLAIM_LENGTH, addDays, frDate, frTime, isHealthItem, isValidDate, joinFr, localParts, newCode, newToken,
+  normalizePhone, parseCode, shiftTime, splitItems, toMinutes, uniqueRole
 } from './util.js';
 
 export function createService({ db, sms, baseUrl, reminderHour = process.env.REMINDER_HOUR || '19:00' }) {
@@ -11,12 +11,13 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
   const today = () => localParts().date;
 
   // --- Désinscriptions (STOP) ------------------------------------------------------
-  const isOptedOut = (phone) => !!q('SELECT 1 FROM opt_outs WHERE phone = ?').get(phone);
+  const isOptedOut = (phone) => !!phone && !!q('SELECT 1 FROM opt_outs WHERE phone = ?').get(phone);
   const optOut = (phone) => q('INSERT OR IGNORE INTO opt_outs (phone) VALUES (?)').run(phone);
   const optIn = (phone) => q('DELETE FROM opt_outs WHERE phone = ?').run(phone);
 
   // Tout SMS sortant passe par ici ; un numéro désinscrit ne reçoit plus rien.
   async function sendSms(phone, body, { changeId = null, kind = 'system' } = {}) {
+    if (!phone) return { ok: false, error: 'numéro non enregistré' };
     if (isOptedOut(phone)) return { ok: false, error: 'numéro désinscrit (STOP)' };
     let providerId = null;
     let error = null;
@@ -29,6 +30,55 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
     q('INSERT INTO sms_log (direction, kind, phone, body, change_id, provider_id, error) VALUES (?, ?, ?, ?, ?, ?, ?)')
       .run('out', kind, phone, body, changeId, providerId, error);
     return { ok: !error, error };
+  }
+
+  // --- Proches : rôle + code d'invitation, jamais de nom ----------------------------------
+  const CLAIM_DAYS = 14;
+  function freshClaimCode() {
+    for (;;) {
+      const code = newCode(CLAIM_LENGTH);
+      if (!q('SELECT 1 FROM coparents WHERE claim_code = ?').get(code)) return code;
+    }
+  }
+  function addCoparent(organizerId, role) {
+    const taken = q('SELECT role FROM coparents WHERE organizer_id = ?').all(organizerId).map((r) => r.role);
+    const finalRole = uniqueRole(role, taken);
+    const r = q(`INSERT INTO coparents (organizer_id, role, claim_code, claim_expires_at)
+                 VALUES (?, ?, ?, datetime('now', '+${CLAIM_DAYS} days'))`).run(organizerId, finalRole, freshClaimCode());
+    return { id: Number(r.lastInsertRowid), role: finalRole };
+  }
+  // Nouveau code : l'ancien numéro est oublié, le proche se ré-enregistre (changement de numéro).
+  function renewClaim(organizerId, id) {
+    const r = q(`UPDATE coparents SET phone = NULL, claim_code = ?, claim_expires_at = datetime('now', '+${CLAIM_DAYS} days')
+                 WHERE id = ? AND organizer_id = ?`).run(freshClaimCode(), id, organizerId);
+    return r.changes === 1;
+  }
+  function findInvitation(code) {
+    const c = parseCode(code, CLAIM_LENGTH);
+    if (!c) return null;
+    return q(`SELECT p.id, p.role, o.role AS organizer_role FROM coparents p JOIN organizers o ON o.id = p.organizer_id
+              WHERE p.claim_code = ? AND p.claim_expires_at > datetime('now')`).get(c) || null;
+  }
+  // Déclare « ce numéro est ce rôle ». Le code ne sert qu'une fois (mise à jour atomique).
+  function claim(code, rawPhone) {
+    const phone = normalizePhone(rawPhone);
+    const c = parseCode(code, CLAIM_LENGTH);
+    if (!phone) return { ok: false, error: 'phone' };
+    if (!c) return { ok: false, error: 'code' };
+    const row = findInvitation(c);
+    if (!row) return { ok: false, error: 'code' };
+    const r = q(`UPDATE coparents SET phone = ?, claim_code = NULL, claim_expires_at = NULL
+                 WHERE id = ? AND claim_code = ?`).run(phone, row.id, c);
+    if (r.changes !== 1) return { ok: false, error: 'code' };
+    return { ok: true, phone, role: row.role, organizerRole: row.organizer_role };
+  }
+  async function claimAndConfirm(code, rawPhone) {
+    const res = claim(code, rawPhone);
+    if (res.ok) {
+      await sendSms(res.phone, `Deux Toits : ce numéro est enregistré comme « ${res.role} ». ${sms.canReceive ? 'STOP pour ne plus recevoir ces messages.' : `Ne plus recevoir ces messages : ${baseUrl}/j`}`,
+        { kind: 'system' });
+    }
+    return res;
   }
 
   function getChange(id) {
@@ -50,7 +100,7 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
       kids,
       kidNames: joinFr(kids.map((k) => k.name)),
       isPast: c.date < today(),
-      organizer: q('SELECT id, name, phone FROM organizers WHERE id = ?').get(c.organizer_id),
+      organizer: q('SELECT id, role, phone FROM organizers WHERE id = ?').get(c.organizer_id),
       coparent: { ...coparent, opted_out: isOptedOut(coparent.phone) }
     };
   }
@@ -70,7 +120,7 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
   }
   function askText(c) {
     const link = `${baseUrl}/r/${c.token}`;
-    const lines = [`${c.organizer.name} : peux-tu ${describe(c)} ?${c.items.length ? ` À prévoir : ${joinFr(c.items)}.` : ''}`];
+    const lines = [`${c.organizer.role} : peux-tu ${describe(c)} ?${c.items.length ? ` À prévoir : ${joinFr(c.items)}.` : ''}`];
     if (sms.canReceive) lines.push(`Réponds OUI ou NON à ce SMS. Pour proposer autre chose : ${link}`);
     else lines.push(`Pour répondre : ${link}`);
     lines.push(stopLine(c));
@@ -81,10 +131,10 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
     const what = c.kind === 'pickup'
       ? `Vous récupérez ${c.kidNames}${c.time ? ` à ${frTime(c.time)}` : ''}${place ? ` à ${place}` : ''}.`
       : `Vous gardez ${c.kidNames}${c.time ? ` à partir de ${frTime(c.time)}` : ''}.`;
-    return [`Rappel de ${c.organizer.name} : demain, ${frDate(c.date)}.`, `${what} À prévoir : ${joinFr(c.items)}.`, stopLine(c)].join('\n');
+    return [`Rappel de ${c.organizer.role} : demain, ${frDate(c.date)}.`, `${what} À prévoir : ${joinFr(c.items)}.`, stopLine(c)].join('\n');
   }
   function answerText(c) {
-    const who = c.coparent.name;
+    const who = c.coparent.role;
     const when = frDate(c.date);
     if (c.status === 'accepted') return `Deux Toits : ${who} a répondu OUI pour ${when}.`;
     if (c.status === 'declined') return `Deux Toits : ${who} ne peut pas pour ${when}. ${baseUrl}/`;
@@ -96,6 +146,7 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
   function parseInput(organizerId, input) {
     const coparent = q('SELECT * FROM coparents WHERE id = ? AND organizer_id = ?').get(Number(input.coparentId), organizerId);
     if (!coparent) throw new UserError('Choisissez le parent à prévenir.');
+    if (!coparent.phone) throw new UserError(`${coparent.role} n'a pas encore enregistré son numéro. Montrez-lui son QR code ou donnez-lui son code (page Famille).`);
     const childIds = [].concat(input.childIds || []).map(Number).filter(Boolean);
     const kids = childIds.length
       ? q(`SELECT * FROM children WHERE organizer_id = ? AND id IN (${childIds.map(() => '?').join(',')})`).all(organizerId, ...childIds)
@@ -122,7 +173,7 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
 
     const change = getChange(id);
     if (change.coparent.opted_out) {
-      return { change, sent: false, reason: `${p.coparent.name} a demandé à ne plus recevoir de SMS. Prévenez-le autrement.` };
+      return { change, sent: false, reason: `${p.coparent.role} a demandé à ne plus recevoir de SMS. Prévenez-le autrement.` };
     }
     const res = await sendSms(p.coparent.phone, askText(change), { changeId: id, kind: 'ask' });
     return { change, sent: res.ok, reason: res.error };
@@ -133,7 +184,7 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
     const p = parseInput(organizerId, input);
     return askText({
       ...p, kidNames: joinFr(p.kids.map((k) => k.name)), token: 'xxxxxx',
-      organizer: q('SELECT id, name, phone FROM organizers WHERE id = ?').get(organizerId)
+      organizer: q('SELECT id, role, phone FROM organizers WHERE id = ?').get(organizerId)
     });
   }
 
@@ -180,7 +231,7 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
                  WHERE id = ? AND status = 'counter'`).run(date, time, c.id);
     if (r.changes !== 1) return { ok: false };
     const updated = getChange(c.id);
-    await sendSms(updated.coparent.phone, `${updated.organizer.name} : c'est d'accord, tu peux ${describe(updated)}. Merci !`,
+    await sendSms(updated.coparent.phone, `${updated.organizer.role} : c'est d'accord, tu peux ${describe(updated)}. Merci !`,
       { changeId: c.id, kind: 'confirm' });
     return { ok: true, change: updated };
   }
@@ -192,7 +243,7 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
     if (r.changes !== 1) return { ok: true, notified: false };
     // On ne dérange l'autre parent que si la demande le concernait encore.
     if (!c.isPast && c.status !== 'declined') {
-      await sendSms(c.coparent.phone, `${c.organizer.name} : finalement, le changement prévu ${frDate(c.date)} est annulé. Rien à faire.`,
+      await sendSms(c.coparent.phone, `${c.organizer.role} : finalement, le changement prévu ${frDate(c.date)} est annulé. Rien à faire.`,
         { changeId: c.id, kind: 'cancel' });
       return { ok: true, notified: true };
     }
@@ -212,6 +263,15 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
   async function handleInbound(rawPhone, body) {
     const phone = normalizePhone(rawPhone) || String(rawPhone);
     q('INSERT INTO sms_log (direction, kind, phone, body) VALUES (?, ?, ?, ?)').run('in', 'reply', phone, String(body).slice(0, 500));
+    // Un SMS qui contient un code d'invitation enregistre l'expéditeur : l'opérateur garantit le numéro.
+    const codeFromSms = parseCode(body, CLAIM_LENGTH);
+    if (codeFromSms) {
+      const res = claim(codeFromSms, phone);
+      if (res.ok) {
+        optIn(phone); // le proche vient d'écrire lui-même : il veut recevoir les messages
+        return { action: 'claim', reply: `C'est enregistré : ce numéro est « ${res.role} ». Vous recevrez les changements de planning de ${res.organizerRole}. STOP pour arrêter.` };
+      }
+    }
     const intent = parseReply(body);
 
     if (intent === 'stop') {
@@ -236,7 +296,7 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
                        WHERE p.phone = ? AND c.status = 'pending' AND c.date >= ? ORDER BY c.id DESC LIMIT 1`).get(phone, today());
     if (!pending) return { action: 'none', reply: null };
     const c = getChange(pending.id);
-    return { action: 'unknown', reply: `Pour répondre à la demande de ${c.organizer.name} (${frDate(c.date)}) : ${baseUrl}/r/${c.token}` };
+    return { action: 'unknown', reply: `Pour répondre à la demande de ${c.organizer.role} (${frDate(c.date)}) : ${baseUrl}/r/${c.token}` };
   }
 
   // --- Rappels de la veille ----------------------------------------------------------------
@@ -286,7 +346,7 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
       let split = false;
       for (const c of accepted) {
         if (c.kind === 'swap') home = 'coparent';
-        else { split = true; notes.push(`${c.coparent.name} vient à ${frTime(c.time)}${c.place ? ` (${c.place})` : ''}`); }
+        else { split = true; notes.push(`${c.coparent.role} vient à ${frTime(c.time)}${c.place ? ` (${c.place})` : ''}`); }
       }
       const isHandover = !!org.rhythm_start && homeOn(org, addDays(date, -1)) !== homeOn(org, date);
       days.push({ date, home, split, isHandover, changes, notes, items: [...new Set(accepted.flatMap((c) => c.items))] });
@@ -296,7 +356,8 @@ export function createService({ db, sms, baseUrl, reminderHour = process.env.REM
 
   return {
     createChange, previewText, getChange, getChangeByToken, respond, acceptCounter, cancelChange, counterOptions,
-    handleInbound, parseReply, runReminders, week, sendSms, isOptedOut, optOut
+    handleInbound, parseReply, runReminders, week, sendSms, isOptedOut, optOut,
+    addCoparent, renewClaim, findInvitation, claim, claimAndConfirm
   };
 }
 

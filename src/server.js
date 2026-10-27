@@ -5,7 +5,10 @@ import { fileURLToPath } from 'node:url';
 import { openDb } from './db.js';
 import { createSmsProvider } from './sms.js';
 import { createService, UserError } from './service.js';
-import { checkPassword, hashPassword, isValidDate, localParts, newToken, normalizePhone, splitItems } from './util.js';
+import QRCode from 'qrcode';
+import {
+  ACCESS_LENGTH, ROLES, groupCode, hashCode, isRole, isValidDate, localParts, newCode, newToken, normalizePhone, parseCode, splitItems
+} from './util.js';
 import * as V from './views.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -54,9 +57,8 @@ export function createApp({ db, sms, baseUrl }) {
   // Express 4 ne capture pas les promesses rejetées : on les renvoie au gestionnaire d'erreurs.
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
-  // --- Comptes -------------------------------------------------------------------
-  app.get('/signup', (req, res) => res.send(V.authPage({ mode: 'signup' })));
-  // Limite simple de tentatives de connexion (mémoire) : 10 essais par 15 min, par IP et par e-mail.
+  // --- Comptes : un rôle, un numéro, un code d'accès. Ni nom, ni e-mail, ni mot de passe. -------------
+  // Limite simple de tentatives (mémoire) : 10 essais par 15 min et par IP, pour la connexion et les codes d'invitation.
   const attempts = new Map();
   const tooMany = (key) => {
     const now = Date.now();
@@ -65,44 +67,86 @@ export function createApp({ db, sms, baseUrl }) {
     return a.length >= 10;
   };
   const record = (key) => attempts.get(key).push(Date.now());
+  const noStore = (res) => res.set('Cache-Control', 'no-store');
 
-  app.post('/signup', wrap(async (req, res) => {
-    const { name = '', email = '', password = '' } = req.body;
+  // Crée un code d'accès neuf (seule son empreinte est gardée) ; il n'est montré qu'une fois.
+  function issueAccessCode(organizerId) {
+    for (let i = 0; ; i++) {
+      const code = newCode(ACCESS_LENGTH);
+      try {
+        db.prepare('UPDATE organizers SET access_hash = ? WHERE id = ?').run(hashCode(code), organizerId);
+        return groupCode(code);
+      } catch (e) { // seule une empreinte déjà prise (improbable) justifie un nouveau tirage
+        if (i >= 3 || !/UNIQUE/i.test(e.message)) throw e;
+      }
+    }
+  }
+
+  app.get('/signup', (req, res) => res.send(V.authPage({ mode: 'signup' })));
+  app.post('/signup', (req, res) => {
+    const role = String(req.body.role || '');
     const phone = normalizePhone(req.body.phone);
-    const values = { name, email, phone: req.body.phone };
-    if (!name.trim() || !email.includes('@')) return res.status(400).send(V.authPage({ mode: 'signup', error: 'Prénom et e-mail sont requis.', values }));
+    const values = { role, phone: req.body.phone };
+    if (!isRole(role)) return res.status(400).send(V.authPage({ mode: 'signup', error: 'Choisissez votre rôle dans la liste.', values }));
     if (!phone) return res.status(400).send(V.authPage({ mode: 'signup', error: 'Ce numéro de téléphone n\'est pas reconnu.', values }));
-    if (password.length < 8) return res.status(400).send(V.authPage({ mode: 'signup', error: 'Le mot de passe doit faire au moins 8 caractères.', values }));
-    try {
-      const r = db.prepare('INSERT INTO organizers (name, email, phone, pass_hash) VALUES (?, ?, ?, ?)')
-        .run(name.trim().slice(0, 40), email.trim().toLowerCase(), phone, await hashPassword(password));
-      startSession(res, Number(r.lastInsertRowid));
-      res.redirect('/famille');
-    } catch {
-      res.status(400).send(V.authPage({ mode: 'signup', error: 'Un compte existe déjà avec cet e-mail.', values }));
-    }
-  }));
+    const placeholder = hashCode(newToken(24)); // remplacé aussitôt par l'empreinte du vrai code
+    const r = db.prepare('INSERT INTO organizers (role, phone, access_hash) VALUES (?, ?, ?)').run(role, phone, placeholder);
+    const id = Number(r.lastInsertRowid);
+    const code = issueAccessCode(id);
+    startSession(res, id);
+    noStore(res).send(V.accessCodePage({ code, first: true }));
+  });
   app.get('/login', (req, res) => res.send(V.authPage({ mode: 'login' })));
-  app.post('/login', wrap(async (req, res) => {
-    const email = String(req.body.email || '').trim().toLowerCase();
-    const keys = [`ip:${req.ip}`, `mail:${email}`];
-    if (keys.some(tooMany)) {
-      return res.status(429).send(V.authPage({ mode: 'login', error: 'Trop de tentatives. Réessayez dans 15 minutes.', values: { email } }));
-    }
-    const org = db.prepare('SELECT * FROM organizers WHERE email = ?').get(email);
-    if (!org || !(await checkPassword(String(req.body.password || ''), org.pass_hash))) {
-      keys.forEach(record);
-      return res.status(401).send(V.authPage({ mode: 'login', error: 'E-mail ou mot de passe incorrect.', values: { email } }));
+  app.post('/login', (req, res) => {
+    const key = `ip:${req.ip}`;
+    if (tooMany(key)) return res.status(429).send(V.authPage({ mode: 'login', error: 'Trop de tentatives. Réessayez dans 15 minutes.' }));
+    const code = parseCode(req.body.code, ACCESS_LENGTH);
+    const org = code && db.prepare('SELECT id FROM organizers WHERE access_hash = ?').get(hashCode(code));
+    if (!org) {
+      record(key);
+      return res.status(401).send(V.authPage({ mode: 'login', error: 'Code d\'accès incorrect.' }));
     }
     startSession(res, org.id);
     res.redirect('/');
-  }));
+  });
   app.post('/logout', (req, res) => {
     const token = readCookie(req, COOKIE);
     if (token) db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
     res.clearCookie(COOKIE);
     res.redirect('/login');
   });
+  // Nouveau code d'accès (appareil perdu, code égaré) : l'ancien cesse de fonctionner, les autres sessions sont fermées.
+  app.post('/compte/code', auth, (req, res) => {
+    const code = issueAccessCode(req.org.id);
+    db.prepare('DELETE FROM sessions WHERE organizer_id = ? AND token != ?').run(req.org.id, readCookie(req, COOKIE));
+    noStore(res).send(V.accessCodePage({ code, first: false }));
+  });
+
+  // --- Invitation d'un proche : « ce numéro est ce rôle » ------------------------------------
+  // Le lien (QR code en présentiel) contient le code ; sans lien, on tape le code sur /j.
+  const joinPage = (res, status, { code = '', invitation = null, error, phone = '' }) =>
+    noStore(res).status(status).send(V.joinPage({ code, invitation, error, phone }));
+  app.get('/j', (req, res) => joinPage(res, 200, {}));
+  app.get('/j/:code', (req, res) => {
+    const invitation = svc.findInvitation(req.params.code);
+    if (!invitation) return joinPage(res, 404, { error: 'Ce code n\'est pas valable ou a expiré. Demandez-en un nouveau.' });
+    joinPage(res, 200, { code: req.params.code, invitation });
+  });
+  app.post('/j', wrap(async (req, res) => {
+    const key = `ip:${req.ip}`;
+    const code = String(req.body.code || '');
+    const phone = String(req.body.phone || '');
+    if (tooMany(key)) return joinPage(res, 429, { code, phone, error: 'Trop de tentatives. Réessayez dans 15 minutes.' });
+    const r = await svc.claimAndConfirm(code, phone);
+    if (!r.ok) {
+      if (r.error === 'code') record(key);
+      return joinPage(res, 400, {
+        code, phone, invitation: svc.findInvitation(code),
+        error: r.error === 'phone' ? 'Ce numéro de téléphone n\'est pas reconnu.' : 'Ce code n\'est pas valable ou a expiré.'
+      });
+    }
+    noStore(res).send(V.joinedPage({ role: r.role, organizerRole: r.organizerRole, canReceive: sms.canReceive }));
+  }));
 
   // --- Accueil -------------------------------------------------------------------
   app.get('/', auth, (req, res) => {
@@ -118,15 +162,23 @@ export function createApp({ db, sms, baseUrl }) {
   });
 
   // --- Famille -------------------------------------------------------------------
-  app.get('/famille', auth, (req, res) => {
-    res.send(V.familyPage({
+  app.get('/famille', auth, wrap(async (req, res) => {
+    const coparents = db.prepare('SELECT * FROM coparents WHERE organizer_id = ? ORDER BY id').all(req.org.id);
+    // QR codes générés ici, en SVG : le code d'invitation ne quitte jamais le serveur.
+    const members = await Promise.all(coparents.map(async (p) => {
+      const link = p.claim_code ? `${baseUrl}/j/${p.claim_code}` : null;
+      return {
+        ...p, opted_out: svc.isOptedOut(p.phone), link,
+        codeLabel: p.claim_code ? groupCode(p.claim_code) : null,
+        qr: link ? await QRCode.toString(link, { type: 'svg', margin: 1, errorCorrectionLevel: 'M' }) : null
+      };
+    }));
+    noStore(res).send(V.familyPage({
       org: req.org,
       kids: db.prepare('SELECT * FROM children WHERE organizer_id = ? ORDER BY name').all(req.org.id),
-      coparents: db.prepare('SELECT * FROM coparents WHERE organizer_id = ? ORDER BY name').all(req.org.id)
-        .map((p) => ({ ...p, opted_out: svc.isOptedOut(p.phone) })),
-      flash: parseFlash(req)
+      coparents: members, roles: ROLES, flash: parseFlash(req), joinUrl: `${baseUrl}/j`
     }));
-  });
+  }));
   app.post('/famille/enfants', auth, (req, res) => {
     const name = String(req.body.name || '').trim().slice(0, 30);
     if (name) db.prepare('INSERT INTO children (organizer_id, name) VALUES (?, ?)').run(req.org.id, name);
@@ -137,11 +189,15 @@ export function createApp({ db, sms, baseUrl }) {
     res.redirect('/famille');
   });
   app.post('/famille/parents', auth, (req, res) => {
-    const name = String(req.body.name || '').trim().slice(0, 30);
-    const phone = normalizePhone(req.body.phone);
-    if (!name || !phone) { flash(res, 'error', 'Prénom et numéro de téléphone valides requis.'); return res.redirect('/famille'); }
-    db.prepare('INSERT INTO coparents (organizer_id, name, phone) VALUES (?, ?, ?)').run(req.org.id, name, phone);
-    flash(res, 'ok', `${name} est ajouté. Il ne recevra un SMS que lorsque vous signalerez un changement.`);
+    const role = String(req.body.role || '');
+    if (!isRole(role)) { flash(res, 'error', 'Choisissez un rôle dans la liste.'); return res.redirect('/famille'); }
+    const added = svc.addCoparent(req.org.id, role);
+    flash(res, 'ok', `${added.role} est ajouté. Montrez-lui son QR code ou donnez-lui son code : c'est lui qui enregistrera son numéro.`);
+    res.redirect('/famille');
+  });
+  app.post('/famille/parents/:id/code', auth, (req, res) => {
+    const ok = svc.renewClaim(req.org.id, Number(req.params.id));
+    flash(res, ok ? 'ok' : 'error', ok ? 'Nouveau code créé. L\'ancien numéro est oublié : la personne doit se ré-enregistrer.' : 'Introuvable.');
     res.redirect('/famille');
   });
   app.post('/famille/parents/:id/supprimer', auth, (req, res) => {
@@ -159,7 +215,7 @@ export function createApp({ db, sms, baseUrl }) {
   // --- Changements -----------------------------------------------------------------
   const formData = (req) => ({
     kids: db.prepare('SELECT * FROM children WHERE organizer_id = ? ORDER BY name').all(req.org.id),
-    coparents: db.prepare('SELECT * FROM coparents WHERE organizer_id = ? ORDER BY name').all(req.org.id)
+    coparents: db.prepare('SELECT * FROM coparents WHERE organizer_id = ? ORDER BY id').all(req.org.id)
   });
   const pick = (b) => ({ kind: b.kind, childIds: b.childIds, date: b.date, time: b.time, place: b.place, coparentId: b.coparentId, items: b.items });
 
@@ -174,14 +230,14 @@ export function createApp({ db, sms, baseUrl }) {
       if (!(e instanceof UserError)) throw e;
       return res.status(400).send(V.changeForm({ ...formData(req), values, error: e.message }));
     }
-    const cp = db.prepare('SELECT name FROM coparents WHERE id = ? AND organizer_id = ?').get(Number(values.coparentId), req.org.id);
+    const cp = db.prepare('SELECT role FROM coparents WHERE id = ? AND organizer_id = ?').get(Number(values.coparentId), req.org.id);
     const { privateItems } = splitItems([].concat(values.items || []).flatMap((s) => String(s).split(',')));
-    res.send(V.previewPage({ text, values, coparentName: cp.name, privateItems }));
+    res.send(V.previewPage({ text, values, coparentName: cp.role, privateItems }));
   });
   app.post('/changes', auth, wrap(async (req, res) => {
     try {
       const { change, sent, reason } = await svc.createChange(req.org.id, pick(req.body));
-      flash(res, sent ? 'ok' : 'error', sent ? `SMS envoyé à ${change.coparent.name}.` : `Changement enregistré, mais le SMS n'est pas parti : ${reason}`);
+      flash(res, sent ? 'ok' : 'error', sent ? `SMS envoyé à ${change.coparent.role}.` : `Changement enregistré, mais le SMS n'est pas parti : ${reason}`);
       res.redirect(`/changes/${change.id}`);
     } catch (e) {
       if (!(e instanceof UserError)) throw e;
@@ -258,7 +314,7 @@ export function createApp({ db, sms, baseUrl }) {
   if (sms.name === 'console') {
     app.get('/dev/sms', auth, (req, res) => {
       const coparents = db.prepare('SELECT * FROM coparents WHERE organizer_id = ?').all(req.org.id);
-      const phones = [req.org.phone, ...coparents.map((p) => p.phone)];
+      const phones = [req.org.phone, ...coparents.map((p) => p.phone)].filter(Boolean);
       const log = db.prepare(`SELECT * FROM sms_log WHERE phone IN (${phones.map(() => '?').join(',')}) ORDER BY id DESC LIMIT 50`).all(...phones);
       res.send(V.devSmsPage({ log, coparents }));
     });

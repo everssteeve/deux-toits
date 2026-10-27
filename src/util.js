@@ -1,5 +1,4 @@
 import crypto from 'node:crypto';
-import { promisify } from 'node:util';
 
 export const TZ = process.env.TZ_FAMILLE || 'Europe/Paris';
 
@@ -13,6 +12,36 @@ export function normalizePhone(raw) {
   if (!/^\+\d{8,15}$/.test(p)) return null;
   return p;
 }
+
+// --- Rôles et codes -----------------------------------------------------
+// Liste fermée : impossible d'enregistrer un prénom à la place d'un rôle.
+export const ROLES = ['Papa', 'Maman', 'Parent', 'Beau-père', 'Belle-mère', 'Papi', 'Mamie', 'Nounou', 'Autre proche'];
+export const isRole = (r) => ROLES.includes(r);
+// Deux proches au même rôle : « Mamie », « Mamie 2 ».
+export function uniqueRole(role, taken) {
+  if (!taken.includes(role)) return role;
+  let n = 2;
+  while (taken.includes(`${role} ${n}`)) n++;
+  return `${role} ${n}`;
+}
+
+// Alphabet sans 0/O/1/I/L : lisible à voix haute et sur un SMS.
+const CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+export function newCode(length) {
+  let out = '';
+  for (const b of crypto.randomBytes(length)) out += CODE_ALPHABET[b % CODE_ALPHABET.length];
+  return out;
+}
+export const CLAIM_LENGTH = 8;   // invitation d'un proche : ABCD-EFGH
+export const ACCESS_LENGTH = 12; // accès de l'organisateur : ABCD-EFGH-JKMN
+export const groupCode = (code) => String(code).match(/.{1,4}/g).join('-');
+// Accepte « abcd efgh », « ABCD-EFGH », « code ABCD-EFGH » ; renvoie null si le format est impossible.
+export function parseCode(raw, length) {
+  const c = String(raw || '').toUpperCase().replace(/^CODE\b/, '').replace(/[\s\-_.]/g, '');
+  return c.length === length && [...c].every((ch) => CODE_ALPHABET.includes(ch)) ? c : null;
+}
+export const hashCode = (code) => crypto.createHash('sha256').update(code).digest('hex');
+export const maskPhone = (p) => (p ? `•• •• •• ${String(p).slice(-2)}` : '');
 
 // --- Santé : jamais dans un SMS ---------------------------------------
 // Comparaison sans accents (les claviers iOS envoient parfois des accents décomposés).
@@ -98,18 +127,4 @@ export function joinFr(list) {
 }
 export function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-// --- Mots de passe (scrypt asynchrone : ne bloque pas le serveur) ----------------
-const scrypt = promisify(crypto.scrypt);
-export async function hashPassword(pw) {
-  const salt = crypto.randomBytes(16);
-  const hash = await scrypt(pw, salt, 32);
-  return `scrypt$${salt.toString('base64')}$${hash.toString('base64')}`;
-}
-export async function checkPassword(pw, stored) {
-  const [, s, h] = String(stored).split('$');
-  if (!s || !h) return false;
-  const hash = await scrypt(pw, Buffer.from(s, 'base64'), 32);
-  return crypto.timingSafeEqual(hash, Buffer.from(h, 'base64'));
 }

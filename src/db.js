@@ -4,12 +4,13 @@ import { DatabaseSync } from 'node:sqlite';
 const SCHEMA = `
 PRAGMA foreign_keys = ON;
 
+-- Aucun nom, prénom ni e-mail d'adulte : un adulte est un rôle (Papa, Maman…) et un numéro.
+-- L'organisateur se reconnecte avec un code d'accès, conservé uniquement sous forme d'empreinte.
 CREATE TABLE IF NOT EXISTS organizers (
   id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL,
-  email TEXT NOT NULL UNIQUE,
+  role TEXT NOT NULL,
   phone TEXT NOT NULL,
-  pass_hash TEXT NOT NULL,
+  access_hash TEXT NOT NULL UNIQUE,
   -- rythme d'alternance : semaine/semaine, l'organisateur a les enfants
   -- la semaine qui commence à rhythm_start (date ISO), changement le jour handover_dow (0 = dimanche)
   rhythm_start TEXT,
@@ -23,11 +24,15 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at TEXT NOT NULL
 );
 
+-- Un proche à prévenir : son numéro est vide tant qu'il n'a pas utilisé son code d'invitation
+-- (page /j, QR code, ou SMS contenant le code). Le code est effacé dès l'enregistrement.
 CREATE TABLE IF NOT EXISTS coparents (
   id INTEGER PRIMARY KEY,
   organizer_id INTEGER NOT NULL REFERENCES organizers(id) ON DELETE CASCADE,
-  name TEXT NOT NULL,
-  phone TEXT NOT NULL,
+  role TEXT NOT NULL,
+  phone TEXT,
+  claim_code TEXT UNIQUE,
+  claim_expires_at TEXT,
   opted_out INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -90,6 +95,11 @@ CREATE INDEX IF NOT EXISTS idx_coparents_phone ON coparents(phone);
 
 export function openDb(file = process.env.DATABASE_FILE || 'deux-toits.sqlite') {
   const db = new DatabaseSync(file);
+  // Ancienne version (prénoms et e-mails en base) : pas de migration automatique, on ne devine pas les rôles.
+  const legacy = db.prepare("SELECT 1 FROM pragma_table_info('organizers') WHERE name IN ('email', 'name')").get();
+  if (legacy) {
+    throw new Error(`${file} contient l'ancien format (noms et e-mails). Supprimez ce fichier, ou choisissez un autre DATABASE_FILE, pour repartir sur le format sans données nominatives.`);
+  }
   db.exec(SCHEMA);
   return db;
 }

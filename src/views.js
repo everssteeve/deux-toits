@@ -1,5 +1,5 @@
 // Gabarits HTML (sans moteur de template). Toute donnée affichée passe par esc().
-import { esc, frDate, frDayName, frTime } from './util.js';
+import { ROLES, esc, frDate, frDayName, frTime, maskPhone } from './util.js';
 
 const ICON = {
   back: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>',
@@ -72,14 +72,57 @@ export function authPage({ mode, error, values = {} }) {
   <h1 class="h-hero">${signup ? 'Quand le planning change, tout le monde est prévenu.' : 'Bon retour'}</h1>
   ${error ? `<p class="flash flash-error" role="alert">${esc(error)}</p>` : ''}
   <form method="post" action="${signup ? '/signup' : '/login'}" class="stack">
-    ${signup ? `<label class="field">Votre prénom<input name="name" required maxlength="40" value="${esc(values.name)}" autocomplete="given-name"></label>
-    <label class="field">Votre téléphone<input name="phone" required inputmode="tel" value="${esc(values.phone)}" autocomplete="tel" placeholder="06 12 34 56 78"><span class="hint">Pour recevoir les réponses de l'autre parent.</span></label>` : ''}
-    <label class="field">E-mail<input name="email" type="email" required value="${esc(values.email)}" autocomplete="email"></label>
-    <label class="field">Mot de passe<input name="password" type="password" required minlength="8" autocomplete="${signup ? 'new-password' : 'current-password'}"></label>
-    <button class="btn btn-primary">${signup ? 'Créer mon compte' : 'Me connecter'}</button>
+    ${signup ? `<label class="field">Vous êtes
+      <select name="role" required>${ROLES.map((r) => `<option value="${esc(r)}" ${values.role === r ? 'selected' : ''}>${esc(r)}</option>`).join('')}</select>
+      <span class="hint">Un rôle, pas un nom : Deux Toits ne garde ni prénom, ni nom, ni e-mail pour les adultes.</span></label>
+    <label class="field">Votre téléphone<input name="phone" required inputmode="tel" value="${esc(values.phone)}" autocomplete="tel" placeholder="06 12 34 56 78"><span class="hint">Pour recevoir les réponses de l'autre parent.</span></label>
+    <button class="btn btn-primary">Créer mon espace</button>` : `<label class="field">Votre code d'accès<input name="code" required autocomplete="off" autocapitalize="characters" spellcheck="false" class="code-input" placeholder="XXXX-XXXX-XXXX"></label>
+    <button class="btn btn-primary">Me connecter</button>`}
   </form>
-  <p class="center">${signup ? 'Déjà un compte ? <a href="/login">Se connecter</a>' : 'Pas encore de compte ? <a href="/signup">Créer un compte</a>'}</p>
-  <p class="fine center">L'autre parent n'a jamais besoin de compte.</p>
+  <p class="center">${signup ? 'Déjà un espace ? <a href="/login">Entrer avec mon code</a>' : 'Pas encore d\'espace ? <a href="/signup">En créer un</a>'}</p>
+  <p class="fine center">${signup ? 'Un code d\'accès vous sera remis : il remplace e-mail et mot de passe. ' : ''}L'autre parent n'a jamais besoin de compte. <a href="/j">J'ai reçu un code d'invitation</a></p>
+</main>`);
+}
+
+// Le code d'accès n'est montré qu'ici : seule son empreinte est gardée.
+export function accessCodePage({ code, first }) {
+  return layout('Votre code d\'accès', `
+<main class="main narrow">
+  <p class="eyebrow">Deux Toits</p>
+  <h1 class="h-hero">${first ? 'Votre espace est prêt.' : 'Nouveau code d\'accès'}</h1>
+  <section class="card card-accent stack-s" aria-label="Code d'accès">
+    <p class="strong">Notez ce code maintenant</p>
+    <p class="code-big" translate="no">${esc(code)}</p>
+    <p class="fine">C'est votre seule clé pour revenir sur un autre appareil. Nous ne le gardons pas : il ne sera plus jamais affiché${first ? '' : ', et l\'ancien code ne fonctionne plus'}.</p>
+  </section>
+  <a class="btn btn-primary btn-big" href="/famille">${first ? 'C\'est noté, continuer' : 'C\'est noté'}</a>
+</main>`);
+}
+
+// --- Invitation d'un proche ------------------------------------------------------
+export function joinPage({ code, invitation, error, phone }) {
+  return layout('Enregistrer mon numéro', `
+<main class="main narrow">
+  <p class="eyebrow">Deux Toits</p>
+  <h1 class="h-hero">${invitation ? `Vous êtes « ${esc(invitation.role)} »` : 'Enregistrer mon numéro'}</h1>
+  <p>${invitation ? `${esc(invitation.organizer_role)} vous invite à recevoir les changements de planning par SMS.` : 'Entrez le code reçu en main propre ou par message.'} Pas de compte, pas de nom : seulement ce numéro, lié à ce rôle.</p>
+  ${error ? `<p class="flash flash-error" role="alert">${esc(error)}</p>` : ''}
+  <form method="post" action="/j" class="stack">
+    <label class="field">Code d'invitation<input name="code" required autocomplete="off" autocapitalize="characters" spellcheck="false" class="code-input" value="${esc(code)}" placeholder="XXXX-XXXX"></label>
+    <label class="field">Votre téléphone<input name="phone" required inputmode="tel" autocomplete="tel" value="${esc(phone)}" placeholder="06 12 34 56 78"></label>
+    <button class="btn btn-primary btn-big">Enregistrer mon numéro</button>
+  </form>
+  <p class="fine">Vous pouvez aussi envoyer ce code par SMS au numéro de Deux Toits quand il vous est communiqué. Un message de confirmation vous est envoyé.</p>
+</main>`);
+}
+
+export function joinedPage({ role, organizerRole, canReceive }) {
+  return layout('C\'est enregistré', `
+<main class="main narrow">
+  <h1 class="h-hero">C'est enregistré.</h1>
+  <section class="status-card status-ok" role="status"><p class="status-title">Ce numéro est « ${esc(role)} »</p>
+    <p>Vous recevrez par SMS les changements de planning de ${esc(organizerRole)}${canReceive ? ' et répondrez OUI ou NON' : ' et répondrez depuis le lien reçu'}. Rien d'autre.</p></section>
+  <p class="fine">Le code est maintenant inutilisable. ${canReceive ? 'Répondez STOP à un SMS pour ne plus rien recevoir.' : 'Chaque SMS contient un lien pour ne plus rien recevoir.'}</p>
 </main>`);
 }
 
@@ -88,7 +131,7 @@ export function homePage({ org, week, recent, setupNeeded, flash }) {
   const next = week.days.find((d) => d.isHandover);
   return layout('Cette semaine', `
 <header class="topbar topbar-home">
-  <div><p class="muted">Bonjour ${esc(org.name)}</p><h1 class="h-page h-xl">Cette semaine</h1></div>
+  <div><p class="muted">Vous êtes ${esc(org.role)}</p><h1 class="h-page h-xl">Cette semaine</h1></div>
 </header>
 <main class="main">
   ${flashBox(flash)}
@@ -131,10 +174,10 @@ function dayRow(d) {
 function changeCard(c) {
   const [label, cls] = STATUS[c.status];
   const what = c.kind === 'pickup' ? `récupération de ${c.kidNames}` : `garde de ${c.kidNames}`;
-  const detail = c.status === 'counter' ? `${c.coparent.name} répond : ${c.counter_label}`
-    : c.status === 'accepted' ? `${c.coparent.name} a confirmé`
-      : c.status === 'declined' ? `${c.coparent.name} ne peut pas`
-        : `Envoyé à ${c.coparent.name}, pas encore de réponse`;
+  const detail = c.status === 'counter' ? `${c.coparent.role} répond : ${c.counter_label}`
+    : c.status === 'accepted' ? `${c.coparent.role} a confirmé`
+      : c.status === 'declined' ? `${c.coparent.role} ne peut pas`
+        : `Envoyé à ${c.coparent.role}, pas encore de réponse`;
   return `<a class="card card-link" href="/changes/${c.id}">
   <span class="row-between"><span class="strong">${esc(frDate(c.date))} · ${esc(what)}</span><span class="badge ${cls}">${label}</span></span>
   <span class="muted">${esc(detail)}</span>
@@ -142,7 +185,23 @@ function changeCard(c) {
 }
 
 // --- Famille ----------------------------------------------------------------
-export function familyPage({ org, kids, coparents, flash }) {
+function memberCard(p) {
+  if (p.phone) {
+    return `<div class="member"><div class="row-between"><span><span class="strong">${esc(p.role)}</span> <span class="muted">${esc(maskPhone(p.phone))} · numéro enregistré${p.opted_out ? ' · a demandé STOP' : ''}</span></span></div>
+    <div class="row-between"><form method="post" action="/famille/parents/${p.id}/code"><button class="btn-text">Changer de numéro</button></form>
+    <form method="post" action="/famille/parents/${p.id}/supprimer"><button class="btn-text">Retirer</button></form></div></div>`;
+  }
+  return `<div class="member member-pending"><div class="row-between"><span><span class="strong">${esc(p.role)}</span> <span class="muted">en attente de son numéro</span></span></div>
+    <div class="invite">
+      <div class="qr" role="img" aria-label="QR code d'invitation pour ${esc(p.role)}">${p.qr}</div>
+      <div class="stack-s"><p class="fine">En présentiel : ${esc(p.role)} scanne ce QR code. À distance : il tape ce code.</p>
+      <p class="code-big code-sm" translate="no">${esc(p.codeLabel)}</p>
+      <p class="fine">Valable 14 jours, une seule fois.</p></div>
+    </div>
+    <div class="row-between"><form method="post" action="/famille/parents/${p.id}/code"><button class="btn-text">Nouveau code</button></form>
+    <form method="post" action="/famille/parents/${p.id}/supprimer"><button class="btn-text">Retirer</button></form></div></div>`;
+}
+export function familyPage({ org, kids, coparents, roles, joinUrl, flash }) {
   return layout('Famille', `
 ${header('Famille')}
 <main class="main">
@@ -152,15 +211,20 @@ ${header('Famille')}
     ${kids.map((k) => `<form method="post" action="/famille/enfants/${k.id}/supprimer" class="row-between"><span class="strong">${esc(k.name)}</span><button class="btn-text">Retirer</button></form>`).join('')}
     <form method="post" action="/famille/enfants" class="row-form"><label class="sr-only" for="kid">Prénom de l'enfant</label><input id="kid" name="name" required maxlength="30" placeholder="Prénom"><button class="btn btn-secondary">Ajouter</button></form>
   </section>
-  <section class="card stack-s" aria-label="Autre parent">
+  <section class="card stack-s" aria-label="Parents et proches à prévenir">
     <h2 class="h-section">Parent(s) à prévenir</h2>
-    <p class="fine">Ils reçoivent des SMS et répondent sans créer de compte.</p>
-    ${coparents.map((p) => `<form method="post" action="/famille/parents/${p.id}/supprimer" class="row-between"><span><span class="strong">${esc(p.name)}</span> <span class="muted">${esc(p.phone)}${p.opted_out ? ' · a demandé STOP' : ''}</span></span><button class="btn-text">Retirer</button></form>`).join('')}
-    <form method="post" action="/famille/parents" class="stack-s">
-      <div class="grid-2"><label class="field">Prénom<input name="name" required maxlength="30"></label>
-      <label class="field">Téléphone<input name="phone" required inputmode="tel" placeholder="06…"></label></div>
+    <p class="fine">Pas de nom : un rôle et un code. Chacun enregistre lui-même son numéro, en scannant son QR code ou en tapant son code sur <span translate="no">${esc(joinUrl)}</span>. Aucun compte à créer.</p>
+    ${coparents.map(memberCard).join('')}
+    <form method="post" action="/famille/parents" class="row-form">
+      <label class="sr-only" for="role">Rôle</label>
+      <select id="role" name="role" required>${roles.map((r) => `<option>${esc(r)}</option>`).join('')}</select>
       <button class="btn btn-secondary">Ajouter</button>
     </form>
+  </section>
+  <section class="card stack-s" aria-label="Mon accès">
+    <h2 class="h-section">Mon accès</h2>
+    <p class="fine">Vous êtes ${esc(org.role)}. Votre code d'accès n'est pas conservé : en cas de perte, créez-en un nouveau (l'ancien cessera de fonctionner).</p>
+    <form method="post" action="/compte/code"><button class="btn btn-secondary">Créer un nouveau code d'accès</button></form>
   </section>
   <section class="card stack-s" aria-label="Rythme">
     <h2 class="h-section">Rythme d'alternance</h2>
@@ -203,7 +267,7 @@ ${header('Signaler un changement', '/')}
     </div>
     <label class="field">Où<input name="place" maxlength="60" value="${esc(v.place || '')}" placeholder="École, dojo, arrêt du car…"></label>
     <label class="field">Qui prévenir
-      <select name="coparentId">${coparents.map((p) => `<option value="${p.id}" ${String(v.coparentId) === String(p.id) ? 'selected' : ''}>${esc(p.name)} · par SMS</option>`).join('')}</select>
+      <select name="coparentId">${coparents.map((p) => `<option value="${p.id}" ${p.phone ? '' : 'disabled'} ${String(v.coparentId) === String(p.id) ? 'selected' : ''}>${esc(p.role)} · ${p.phone ? 'par SMS' : 'numéro non enregistré'}</option>`).join('')}</select>
     </label>
     <fieldset class="fs"><legend>À prévoir</legend>
       <div class="chips">${SUGGESTED_ITEMS.map((i) => `<label class="chip"><input type="checkbox" name="items" value="${esc(i)}" ${selectedItems.includes(i) ? 'checked' : ''}><span>${esc(i)}</span></label>`).join('')}</div>
@@ -238,10 +302,10 @@ ${header(frDate(c.date), '/')}
   ${flashBox(flash)}
   <section class="status-card ${c.status === 'accepted' ? 'status-ok' : ''}" aria-label="Statut">
     <span class="badge ${cls}">${label}</span>
-    <p class="status-title">${c.status === 'accepted' ? `${esc(c.coparent.name)} a confirmé`
-      : c.status === 'counter' ? `${esc(c.coparent.name)} répond : ${esc(c.counter_label)}`
-        : c.status === 'declined' ? `${esc(c.coparent.name)} ne peut pas`
-          : `En attente de la réponse de ${esc(c.coparent.name)}`}</p>
+    <p class="status-title">${c.status === 'accepted' ? `${esc(c.coparent.role)} a confirmé`
+      : c.status === 'counter' ? `${esc(c.coparent.role)} répond : ${esc(c.counter_label)}`
+        : c.status === 'declined' ? `${esc(c.coparent.role)} ne peut pas`
+          : `En attente de la réponse de ${esc(c.coparent.role)}`}</p>
     <p>${c.kind === 'pickup' ? 'Récupération' : 'Garde'} de ${esc(c.kidNames)}${c.time ? ` · ${esc(frTime(c.time))}` : ''}${c.place ? ` · ${esc(c.place)}` : ''}</p>
     ${c.items.length ? `<p>À prévoir : ${esc(c.items.join(', '))}</p>` : ''}
     ${c.privateItems.length ? `<p class="fine">Note privée (non envoyée par SMS) : ${esc(c.privateItems.join(', '))}</p>` : ''}
@@ -251,7 +315,7 @@ ${header(frDate(c.date), '/')}
     ${smsLog.map((m) => `<div class="log"><p class="fine">${m.direction === 'out' ? 'Envoyé' : 'Reçu'} · ${esc(m.created_at)} UTC${m.error ? ` · échec : ${esc(m.error)}` : ''}</p><p>${esc(m.body).replace(/\n/g, '<br>')}</p></div>`).join('')}
   </section>
   ${c.status === 'counter' && !c.isPast ? `<form method="post" action="/changes/${c.id}/accepter-proposition"><button class="btn btn-primary btn-big">Accepter : ${esc(c.counter_label)}</button></form>` : ''}
-  ${c.coparent.opted_out ? `<p class="fine">${esc(c.coparent.name)} a demandé à ne plus recevoir de SMS : prévenez-le autrement.</p>` : ''}
+  ${c.coparent.opted_out ? `<p class="fine">${esc(c.coparent.role)} a demandé à ne plus recevoir de SMS : prévenez-le autrement.</p>` : ''}
   ${c.status !== 'cancelled' && !c.isPast ? `<form method="post" action="/changes/${c.id}/annuler"><button class="btn btn-secondary">Annuler ce changement</button></form>` : ''}
 </main>`, { nav: 'home' });
 }
@@ -265,7 +329,7 @@ export function replyPage({ change, options, done, flash, optedOut = false }) {
   return layout(q, `
 <div class="urlbar">Aucun compte nécessaire</div>
 <main class="main">
-  <p class="muted">${esc(c.organizer.name)} vous demande</p>
+  <p class="muted">${esc(c.organizer.role)} vous demande</p>
   <h1 class="h-page h-xl">${esc(q)}</h1>
   <dl class="facts">
     ${c.time ? `<div><dt>Heure</dt><dd>${esc(frTime(c.time))}</dd></div>` : ''}
@@ -274,8 +338,8 @@ export function replyPage({ change, options, done, flash, optedOut = false }) {
   </dl>
   ${flashBox(flash)}
   ${done || c.status !== 'pending'
-    ? `<section class="status-card status-ok" role="status"><p class="status-title">${c.status === 'accepted' ? `Merci, ${esc(c.organizer.name)} est prévenue.` : 'Réponse envoyée.'}</p>
-       <p>${c.status === 'accepted' && c.items.length ? 'Un rappel arrivera la veille au soir. Répondez STOP au SMS pour ne plus en recevoir.' : `${esc(c.organizer.name)} reçoit votre réponse par SMS.`}</p></section>`
+    ? `<section class="status-card status-ok" role="status"><p class="status-title">${c.status === 'accepted' ? `Merci, c'est transmis à ${esc(c.organizer.role)}.` : 'Réponse envoyée.'}</p>
+       <p>${c.status === 'accepted' && c.items.length ? 'Un rappel arrivera la veille au soir. Répondez STOP au SMS pour ne plus en recevoir.' : `${esc(c.organizer.role)} reçoit votre réponse par SMS.`}</p></section>`
     : `<form method="post" action="/r/${esc(c.token)}" class="stack-s">
         <button name="answer" value="yes" class="btn btn-primary btn-big">Oui, c'est noté</button>
         <fieldset class="fs"><legend>Ou proposer autre chose</legend>
@@ -307,7 +371,7 @@ export function printPage({ week, kids, start, bw }) {
       <button class="btn btn-primary" onclick="window.print()">Imprimer</button>
     </div>
   </header>
-  <p class="legend"><span class="sw sw-a">${ICON.houseRound}</span>Chez ${esc(week.org.name)} (le rond) <span class="sw sw-b">${ICON.houseSquare}</span>Chez l'autre parent (le carré)</p>
+  <p class="legend"><span class="sw sw-a">${ICON.houseRound}</span>Chez ${esc(week.org.role)} (le rond) <span class="sw sw-b">${ICON.houseSquare}</span>Chez l'autre parent (le carré)</p>
   <ol class="print-days">
     ${days.map((d) => `<li class="print-day">
       <span class="sws">${swatch(d.home)}${d.split ? swatch(d.home === 'organizer' ? 'coparent' : 'organizer') : ''}</span>
@@ -328,7 +392,7 @@ ${header('SMS simulés', '/')}
   <p class="muted">Mode test : aucun SMS réel n'est envoyé. Simulez ici la réponse de l'autre parent.</p>
   <form method="post" action="/dev/sms" class="card stack-s">
     <label class="field">Depuis le numéro de
-      <select name="from">${coparents.map((p) => `<option value="${esc(p.phone)}">${esc(p.name)} (${esc(p.phone)})</option>`).join('')}</select>
+      <select name="from">${coparents.filter((p) => p.phone).map((p) => `<option value="${esc(p.phone)}">${esc(p.role)} (${esc(p.phone)})</option>`).join('')}</select>
     </label>
     <label class="field">Message<input name="body" required placeholder="OUI, NON, STOP…"></label>
     <button class="btn btn-primary">Simuler la réponse SMS</button>
